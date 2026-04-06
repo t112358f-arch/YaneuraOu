@@ -298,9 +298,6 @@ struct Stack {
 
     // このnodeでのreductionの量
     int reduction;
-
-    // 前回iterationのPVラインを追跡中か (followPV quiet pruning用)
-    bool followPV;
 };
 
 
@@ -446,9 +443,6 @@ class YaneuraOuWorker: public Worker {
 
     TTMoveHistory    ttMoveHistory;
     SharedHistories& sharedHistory;
-
-    // 前回iterationのPVライン (followPV quiet pruning用)
-    std::vector<Move> previousPV;
 
    private:
     // 反復深化
