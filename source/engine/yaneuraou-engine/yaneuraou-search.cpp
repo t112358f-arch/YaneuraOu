@@ -1341,6 +1341,11 @@ void Search::YaneuraOuWorker::iterative_deepening() {
             // それぞれのdepthとPV lineに対するUSI infoで出力するselDepth
             selDepth = 0;
 
+            // 前回iterationのPVを保存し、rootのfollowPVをtrueに設定
+            // (followPV quiet pruning: PVライン上の手を枝刈りから保護する)
+            previousPV = rootMoves[pvIdx].pv;
+            ss->followPV = true;
+
             // ------------------------
             // Aspiration window search
             // ------------------------
@@ -2866,7 +2871,8 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
     // -----------------------
 
     //  🖊 evalがbetaを超えているので1手パスしてもbetaは超えそう。だからnull moveを試す
-    if (cutNode && ss->staticEval >= beta - 18 * depth + 390 && !excludedMove
+    //  improving時はmarginを50増やし、NMPをより積極的に発動させる (rshogi由来)
+    if (cutNode && ss->staticEval >= beta - 18 * depth + 390 - 50 * improving && !excludedMove
 #if STOCKFISH
         && pos.non_pawn_material(us)
     // 💡 盤上にpawn以外の駒がある ≒ pawnだけの終盤ではない。
@@ -2893,6 +2899,9 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
         // 📃 王手がかかっている局面では ⇑の方にある goto moves_loop; によってそっちに行ってるので、
         //     ここでは現局面で手番側に王手がかかっていない = 直前の指し手(非手番側)は王手ではない ことがわかっている。
         //     do_null_move()は、この条件を満たす必要がある。
+
+        // null moveはPVに含まれないのでfollowPVを切る
+        (ss + 1)->followPV = false;
 
         do_null_move(pos, st);
 
@@ -2949,7 +2958,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
     // 十分な探索深さがある場合、置換表（TTMove）に手がないPVノードやCutノードについては探索深さを削減する。
     //（*Scaler）IIR をよりアグレッシブにすると、スケーリング効率が悪化する。
 
-    if (!allNode && depth >= 6 && !ttData.move && priorReduction <= 3)
+    if (!allNode && depth >= 6 && !ttData.move && priorReduction <= 3 && !ss->followPV)
         depth--;
 
 #if OLD_CODE
@@ -3022,6 +3031,11 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
             // ⚠ moveとして歩の成りも返ってくるが、これがcapture_stage()と一致するとは限らない。
             //     MovePickerはprob cutの時に、
             //    (GenerateAllLegalMovesオプションがオンであっても)歩の成らずは返してこないことを保証すべき。
+
+            // ProbCut: 子ノードのfollowPVを設定
+            (ss + 1)->followPV = ss->followPV
+                && ss->ply < (int)previousPV.size()
+                && move == previousPV[ss->ply];
 
 #if STOCKFISH
             do_move(pos, move, st, ss);
@@ -3274,8 +3288,11 @@ moves_loop:  // When in check, search starts here
                     continue;
 
             }
-            else
+            else if (!ss->followPV || !PvNode)
             {
+                // followPV かつ PV ノードの場合は quiet pruning をスキップ (Stockfish 準拠)
+                // continuation history pruning / futility pruning / SEE pruning の全3チェックを通過する
+
                 int history = (*contHist[0])[movedPiece][move.to_sq()]
                             + (*contHist[1])[movedPiece][move.to_sq()]
                             + sharedHistory.pawn_entry(pos)[movedPiece][move.to_sq()];
@@ -3495,6 +3512,12 @@ moves_loop:  // When in check, search starts here
         // Step 16. Make the move
         // Step 16. 指し手で進める
         // -----------------------
+
+		// followPV: 子ノードのfollowPVを設定
+        // 親がPV追跡中かつ、この手が前回iterationのPVと一致する場合のみ子も追跡を継続
+        (ss + 1)->followPV = ss->followPV
+            && ss->ply < (int)previousPV.size()
+            && move == previousPV[ss->ply];
 
 		// 指し手で1手進める
         do_move(pos, move, st, givesCheck, ss);
