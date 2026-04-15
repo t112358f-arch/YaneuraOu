@@ -436,8 +436,6 @@ namespace {
         constexpr int kEToIndex[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2 };
         int idx = kFToIndex[f_rank] + kEToIndex[e_rank];
 #endif
-        if (idx < 0) idx = 0;
-        if (idx >= kLayerStacks) idx = kLayerStacks - 1;
         return idx;
     }
 #endif
