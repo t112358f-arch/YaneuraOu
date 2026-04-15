@@ -666,7 +666,3 @@ void print_eval_stat(Position& /*pos*/) {
 } // namespace YaneuraOu
 
 #endif  // defined(EVAL_NNUE)
- // namespace Eval
-} // namespace YaneuraOu
-
-#endif  // defined(EVAL_NNUE)
