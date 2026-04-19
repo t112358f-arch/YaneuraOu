@@ -1,4 +1,4 @@
-﻿﻿// Input features and network structure used in NNUE evaluation function
+﻿// Input features and network structure used in NNUE evaluation function
 // NNUE評価関数で用いる入力特徴量とネットワーク構造
 
 #ifndef CLASSIC_NNUE_ARCHITECTURE_H_INCLUDED
