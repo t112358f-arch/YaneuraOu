@@ -81,7 +81,3 @@ namespace Eval::NNUE {
 #endif  // defined(EVAL_NNUE)
 
 #endif // #ifndef NNUE_ARCHITECTURE_H_INCLUDED
-
-#endif  // defined(EVAL_NNUE)
-
-#endif // #ifndef NNUE_ARCHITECTURE_H_INCLUDED
