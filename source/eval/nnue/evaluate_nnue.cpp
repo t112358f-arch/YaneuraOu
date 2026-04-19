@@ -37,8 +37,42 @@ extern int FV_SCALE;
 namespace {
 
 // バケットモード
-enum class LSBucketMode { KingRank9, Progress8KPAbs };
+enum class LSBucketMode { KingRank9, KingColor9, Progress8KPAbs };
 LSBucketMode ls_bucket_mode = LSBucketMode::KingRank9;
+
+// ルックアップテーブル共通構造体
+// f[sq]: 先手視点正規化済み sq に対する自玉側バケット寄与値
+// e[sq]: 先手視点正規化済み sq に対する敵玉側バケット寄与値
+struct BucketTable { int8_t f[81]; int8_t e[81]; };
+
+// KingRank9 テーブル（コンパイル時生成）
+//   f = (r/3)*3  (r=sq%9)    → 段0-2:0 / 段3-5:3 / 段6-8:6
+//   e = (8-r)/3              → 段0-2:2 / 段3-5:1 / 段6-8:0
+static constexpr BucketTable kBucketKingRank9 = []() constexpr {
+    BucketTable t{};
+    for (int sq = 0; sq < 81; ++sq) {
+        const int r = sq % 9;
+        t.f[sq] = static_cast<int8_t>((r / 3) * 3);
+        t.e[sq] = static_cast<int8_t>((8 - r) / 3);
+    }
+    return t;
+}();
+
+// KingColor9 テーブル（コンパイル時生成）
+//   sq = file*9 + rank なので sq%2 = (file+rank)%2 = 市松模様色(四つ角=0=白)
+//   Inv(sq)=80-sq, 80は偶数 → Inv(sq)%2 == sq%2（先後反転で色不変）
+//   f = r>=6 ? 3*(c+1) : 0  → 自陣後ろ3段のみ非ゼロ
+//   e = r<=2 ? (c+1)   : 0  → 相手陣後ろ3段のみ非ゼロ
+static constexpr BucketTable kBucketKingColor9 = []() constexpr {
+    BucketTable t{};
+    for (int sq = 0; sq < 81; ++sq) {
+        const int r = sq % 9;
+        const int c = sq % 2;  // 0=白マス, 1=黒マス
+        t.f[sq] = static_cast<int8_t>(r >= 6 ? 3 * (c + 1) : 0);
+        t.e[sq] = static_cast<int8_t>(r <= 2 ?     (c + 1) : 0);
+    }
+    return t;
+}();
 
 // progress8kpabs の重み (81 * fe_old_end floats)
 // progress.bin = f64[81][fe_old_end], 読み込み時に f32 に変換
@@ -206,6 +240,8 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
                     std::string mode = std::string(o);
                     if (mode == "progress8kpabs")
                         ls_bucket_mode = LSBucketMode::Progress8KPAbs;
+                    else if (mode == "kingcolor9")
+                        ls_bucket_mode = LSBucketMode::KingColor9;
                     else
                         ls_bucket_mode = LSBucketMode::KingRank9;
                     return std::nullopt;
@@ -467,8 +503,12 @@ namespace {
         tls_acc_cache.invalidate();
     }
     // レイヤースタックの選択。
-    // kingrank9: 双方の玉の段に応じて9通りに分岐させる。
+    // kingrank9   : 双方の玉の段に応じて9通りに分岐させる。
+    // kingcolor9  : 自陣後ろ3段か否か × 玉のマス色(市松模様)で9通りに分岐させる。
     // progress8kpabs: KP-absolute 進行度に応じて8通りに分岐させる。
+    //
+    // kingrank9 / kingcolor9 はルックアップテーブルで高速化。
+    // 後手番のとき両玉を Inv(sq)=80-sq で先手視点に正規化してテーブルを共用する。
     static int stack_index_for_nnue(const Position& pos) {
         if (ls_bucket_mode == LSBucketMode::Progress8KPAbs && progress_kpabs_weights != nullptr) {
             int bucket = compute_progress8kpabs_bucket(pos);
@@ -478,18 +518,17 @@ namespace {
             return bucket;
         }
 
-        // デフォルト: kingrank9
-        constexpr int kFToIndex[] = { 0, 0, 0, 3, 3, 3, 6, 6, 6 };
-        constexpr int kEToIndex[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2 };
-        const auto stm = pos.side_to_move();
+        const auto stm    = pos.side_to_move();
         const auto f_king = pos.square<KING>(stm);
         const auto e_king = pos.square<KING>(~stm);
-        const auto f_rank = stm == BLACK ? rank_of(f_king) : rank_of(Inv(f_king));
-        const auto e_rank = stm == BLACK ? rank_of(Inv(e_king)) : rank_of(e_king);
-        int idx = kFToIndex[f_rank] + kEToIndex[e_rank];
-        if (idx < 0) idx = 0;
-        if (idx >= kLayerStacks) idx = kLayerStacks - 1;
-        return idx;
+        // 後手番は Inv() で先手視点に正規化（テーブルを共用するため）
+        const int f_sq = stm == BLACK ? (int)f_king : (int)Inv(f_king);
+        const int e_sq = stm == BLACK ? (int)e_king : (int)Inv(e_king);
+
+        const BucketTable& tbl = (ls_bucket_mode == LSBucketMode::KingColor9)
+                                 ? kBucketKingColor9
+                                 : kBucketKingRank9;
+        return static_cast<int>(tbl.f[f_sq]) + static_cast<int>(tbl.e[e_sq]);
     }
 #endif
 
