@@ -45,6 +45,10 @@ LSBucketMode ls_bucket_mode = LSBucketMode::KingRank9;
 // e[sq]: 先手視点正規化済み sq に対する敵玉側バケット寄与値
 struct BucketTable { int8_t f[81]; int8_t e[81]; };
 
+// stm(手番) と両玉位置の組み合わせから最終バケット(0..8)を直接引くテーブル。
+// [stm][f_king_sq][e_king_sq]
+struct KingPairBucketIndexTable { uint8_t v[YaneuraOu::COLOR_NB][81][81]; };
+
 // KingRank9 テーブル（コンパイル時生成）
 //   f = (r/3)*3  (r=sq%9)    → 段0-2:0 / 段3-5:3 / 段6-8:6
 //   e = (8-r)/3              → 段0-2:2 / 段3-5:1 / 段6-8:0
@@ -74,10 +78,53 @@ static constexpr BucketTable kBucketKingColor9 = []() constexpr {
     return t;
 }();
 
+static constexpr KingPairBucketIndexTable make_king_pair_bucket_index_table(const BucketTable& tbl) {
+    KingPairBucketIndexTable t{};
+    for (int stm = 0; stm < YaneuraOu::COLOR_NB; ++stm) {
+        for (int f_king = 0; f_king < 81; ++f_king) {
+            for (int e_king = 0; e_king < 81; ++e_king) {
+                // 後手番では先手視点へ正規化した値で参照する。
+                const int f_sq = (stm == YaneuraOu::BLACK)
+                    ? f_king
+                    : static_cast<int>(YaneuraOu::Inv(static_cast<YaneuraOu::Square>(f_king)));
+                const int e_sq = (stm == YaneuraOu::BLACK)
+                    ? e_king
+                    : static_cast<int>(YaneuraOu::Inv(static_cast<YaneuraOu::Square>(e_king)));
+                t.v[stm][f_king][e_king] = static_cast<uint8_t>(tbl.f[f_sq] + tbl.e[e_sq]);
+            }
+        }
+    }
+    return t;
+}
+
+// hand-crafted bucket モード用の最終バケットLUT。
+static constexpr KingPairBucketIndexTable kKingPairBucketKingRank9 =
+    make_king_pair_bucket_index_table(kBucketKingRank9);
+static constexpr KingPairBucketIndexTable kKingPairBucketKingColor9 =
+    make_king_pair_bucket_index_table(kBucketKingColor9);
+
+// 非 progress8kpabs 時に使用する有効LUT。
+// progress8kpabs で progress.bin 未ロード時は kingrank9 へフォールバックする。
+const KingPairBucketIndexTable* active_king_pair_bucket_table = &kKingPairBucketKingRank9;
+
 // progress8kpabs の重み (81 * fe_old_end floats)
 // progress.bin = f64[81][fe_old_end], 読み込み時に f32 に変換
 constexpr int PROGRESS_KP_ABS_NUM_WEIGHTS = 81 * YaneuraOu::Eval::fe_old_end;
 float* progress_kpabs_weights = nullptr;
+
+void set_ls_bucket_mode(const std::string& mode) {
+    if (mode == "progress8kpabs") {
+        ls_bucket_mode = LSBucketMode::Progress8KPAbs;
+        // progress.bin 未ロード時の互換フォールバック
+        active_king_pair_bucket_table = &kKingPairBucketKingRank9;
+    } else if (mode == "kingcolor9") {
+        ls_bucket_mode = LSBucketMode::KingColor9;
+        active_king_pair_bucket_table = &kKingPairBucketKingColor9;
+    } else {
+        ls_bucket_mode = LSBucketMode::KingRank9;
+        active_king_pair_bucket_table = &kKingPairBucketKingRank9;
+    }
+}
 
 // sigmoid(x)*8 = k となる x の閾値 (k=1..7)
 // x = ln(k / (8-k))
@@ -237,13 +284,7 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
 #if defined(SFNNwoPSQT)
     // LayerStacks バケット選択モード
     Options.add("LS_BUCKET_MODE", Option("kingrank9", [](const Option& o) {
-                    std::string mode = std::string(o);
-                    if (mode == "progress8kpabs")
-                        ls_bucket_mode = LSBucketMode::Progress8KPAbs;
-                    else if (mode == "kingcolor9")
-                        ls_bucket_mode = LSBucketMode::KingColor9;
-                    else
-                        ls_bucket_mode = LSBucketMode::KingRank9;
+                    set_ls_bucket_mode(std::string(o));
                     return std::nullopt;
                 }));
 
@@ -518,17 +559,11 @@ namespace {
             return bucket;
         }
 
-        const auto stm    = pos.side_to_move();
-        const auto f_king = pos.square<KING>(stm);
-        const auto e_king = pos.square<KING>(~stm);
-        // 後手番は Inv() で先手視点に正規化（テーブルを共用するため）
-        const int f_sq = stm == BLACK ? (int)f_king : (int)Inv(f_king);
-        const int e_sq = stm == BLACK ? (int)e_king : (int)Inv(e_king);
-
-        const BucketTable& tbl = (ls_bucket_mode == LSBucketMode::KingColor9)
-                                 ? kBucketKingColor9
-                                 : kBucketKingRank9;
-        return static_cast<int>(tbl.f[f_sq]) + static_cast<int>(tbl.e[e_sq]);
+        const auto stm = pos.side_to_move();
+        const int stm_i = static_cast<int>(stm);
+        const int f_king = static_cast<int>(pos.square<KING>(stm));
+        const int e_king = static_cast<int>(pos.square<KING>(~stm));
+        return static_cast<int>(active_king_pair_bucket_table->v[stm_i][f_king][e_king]);
     }
 #endif
 
