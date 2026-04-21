@@ -549,7 +549,15 @@ class FeatureTransformer {
 
 		// USE_ELEMENT_WISE_MULTIPLY は SFNNwoPSQT で常に定義される
 #if defined(VECTOR)
+		// AVX-512 では vec_t = __m512i (64 bytes = 32 int16) なので OutputChunkSize も
+		// 非キャッシュ版 Transform と同様に 64 にする必要がある。
+		// kSimdWidth は USE_AVX512 時も USE_AVX2 の値 (32) のままなので
+		// そのまま使うとループ上限が 2 倍になり境界外アクセス → クラッシュする。
+#if defined(USE_AVX512)
+		constexpr IndexType OutputChunkSize = 64;
+#else
 		constexpr IndexType OutputChunkSize = kSimdWidth;
+#endif
 		static_assert((kHalfDimensions / 2) % OutputChunkSize == 0);
 		constexpr IndexType NumOutputChunks = kHalfDimensions / 2 / OutputChunkSize;
 
