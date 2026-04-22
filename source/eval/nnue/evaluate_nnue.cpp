@@ -47,7 +47,7 @@ struct BucketTable { int8_t f[81]; int8_t e[81]; };
 
 // stm(手番) と両玉位置の組み合わせから最終バケット(0..8)を直接引くテーブル。
 // [stm][f_king_sq][e_king_sq]
-struct KingPairBucketIndexTable { uint8_t v[YaneuraOu::COLOR_NB][81][81]; };
+struct alignas(64) KingPairBucketIndexTable { uint8_t v[YaneuraOu::COLOR_NB][81][81]; };
 
 // KingRank9 テーブル（コンパイル時生成）
 //   f = (r/3)*3  (r=sq%9)    → 段0-2:0 / 段3-5:3 / 段6-8:6
