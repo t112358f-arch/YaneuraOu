@@ -9,6 +9,9 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <cctype>
+#include <cstdlib>
+#include <memory>
 
 #define INCBIN_SILENCE_BITCODE_WARNING
 #include "../../incbin/incbin.h"
@@ -35,6 +38,178 @@ extern int FV_SCALE;
 
 #if defined(SFNNwoPSQT)
 namespace {
+
+#if defined(SFNNwoPSQT_KBT)
+
+// KBTではjsonのtableを「自玉側のhalf bucket表」として読む。
+// jsonは普通の将棋盤向き(上から1段、左から9筋)で、YaneuraOuのSquareは
+// file*9+rank(1筋1段が0)なので、読み込み時に座標を変換する。
+std::string ls_king_bucket_table_path = "kingcolor9.json";
+std::vector<int> active_king_bucket_table;
+
+int kbt_table_index(int stm, int f_king, int e_king) {
+    return (stm * 81 + f_king) * 81 + e_king;
+}
+
+int json_table_index_from_yaneuraou_square(int sq) {
+    const int file = sq / 9; // 0=1筋
+    const int rank = sq % 9; // 0=1段
+    return rank * 9 + (8 - file);
+}
+
+int inverse_square_index(int sq) {
+    return 80 - sq;
+}
+
+const char* skip_json_ws(const char* p) {
+    while (*p && std::isspace(static_cast<unsigned char>(*p)))
+        ++p;
+    return p;
+}
+
+bool parse_json_int_key(const std::string& text, const char* key, int& out) {
+    const std::string needle = std::string("\"") + key + "\"";
+    auto pos = text.find(needle);
+    if (pos == std::string::npos)
+        return false;
+    pos = text.find(':', pos + needle.size());
+    if (pos == std::string::npos)
+        return false;
+
+    const char* p = skip_json_ws(text.c_str() + pos + 1);
+    char* end = nullptr;
+    const long value = std::strtol(p, &end, 10);
+    if (end == p || value < 1 || value > 46340)
+        return false;
+    out = static_cast<int>(value);
+    return true;
+}
+
+bool parse_json_table_values(const std::string& text, std::vector<int>& values) {
+    const std::string needle = "\"table\"";
+    auto pos = text.find(needle);
+    if (pos == std::string::npos)
+        return false;
+    pos = text.find(':', pos + needle.size());
+    if (pos == std::string::npos)
+        return false;
+    pos = text.find('[', pos + 1);
+    if (pos == std::string::npos)
+        return false;
+
+    values.clear();
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    for (size_t i = pos; i < text.size(); ++i) {
+        const char c = text[i];
+        if (in_string) {
+            if (escaped)
+                escaped = false;
+            else if (c == '\\')
+                escaped = true;
+            else if (c == '"')
+                in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '[') {
+            ++depth;
+            continue;
+        }
+        if (c == ']') {
+            --depth;
+            if (depth == 0)
+                break;
+            if (depth < 0)
+                return false;
+            continue;
+        }
+        if (depth >= 2 && (std::isdigit(static_cast<unsigned char>(c)) || c == '-')) {
+            char* end = nullptr;
+            const char* p = text.c_str() + i;
+            const long value = std::strtol(p, &end, 10);
+            if (end == p || value < 0 || value > 65535)
+                return false;
+            values.push_back(static_cast<int>(value));
+            i = static_cast<size_t>(end - text.c_str() - 1);
+        }
+    }
+
+    return depth == 0 && values.size() == 81;
+}
+
+bool load_king_bucket_table_json(const std::string& path) {
+    using namespace YaneuraOu;
+
+    std::ifstream ifs(path);
+    if (!ifs) {
+        sync_cout << "info string failed to open LS_KING_BUCKET_TABLE: " << path << sync_endl;
+        return false;
+    }
+
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+    const std::string text = ss.str();
+
+    int num_half_buckets = 0;
+    if (!parse_json_int_key(text, "num_half_buckets", num_half_buckets)) {
+        sync_cout << "info string invalid LS_KING_BUCKET_TABLE num_half_buckets: " << path << sync_endl;
+        return false;
+    }
+
+    std::vector<int> readable_values;
+    if (!parse_json_table_values(text, readable_values)) {
+        sync_cout << "info string invalid LS_KING_BUCKET_TABLE table (expected 9x9 integers): "
+                  << path << sync_endl;
+        return false;
+    }
+
+    const int num_buckets = num_half_buckets * num_half_buckets;
+    std::vector<int> own_half_bucket(81);
+    for (int sq = 0; sq < 81; ++sq) {
+        const int value = readable_values[json_table_index_from_yaneuraou_square(sq)];
+        if (value < 0 || value >= num_half_buckets) {
+            sync_cout << "info string LS_KING_BUCKET_TABLE value out of range at square "
+                      << sq << ": " << value << " (num_half_buckets=" << num_half_buckets << ")"
+                      << sync_endl;
+            return false;
+        }
+        own_half_bucket[sq] = value;
+    }
+
+    std::vector<int> expanded(2 * 81 * 81);
+    for (int stm = 0; stm < 2; ++stm) {
+        for (int f_king = 0; f_king < 81; ++f_king) {
+            for (int e_king = 0; e_king < 81; ++e_king) {
+                const int f_sq = (stm == static_cast<int>(YaneuraOu::BLACK))
+                    ? f_king
+                    : inverse_square_index(f_king);
+                const int e_sq = (stm == static_cast<int>(YaneuraOu::BLACK))
+                    ? e_king
+                    : inverse_square_index(e_king);
+                const int f_half = own_half_bucket[f_sq];
+                const int e_half = own_half_bucket[inverse_square_index(e_sq)];
+                expanded[kbt_table_index(stm, f_king, e_king)] =
+                    f_half * num_half_buckets + e_half;
+            }
+        }
+    }
+
+    YaneuraOu::Eval::NNUE::kLayerStacks = num_buckets;
+    active_king_bucket_table.swap(expanded);
+
+    sync_cout << "info string loaded king bucket table: num_half_buckets="
+              << num_half_buckets << " LayerStacks=" << num_buckets
+              << " from " << path << sync_endl;
+    return true;
+}
+
+#else
 
 // バケットモード
 enum class LSBucketMode { KingRank9, KingColor9, Progress8KPAbs };
@@ -213,6 +388,8 @@ bool load_progress_bin(const std::string& path) {
     return true;
 }
 
+#endif
+
 } // anonymous namespace
 #endif // defined(SFNNwoPSQT)
  
@@ -281,7 +458,17 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
                     return std::nullopt;
                 }));
 
-#if defined(SFNNwoPSQT)
+#if defined(SFNNwoPSQT_KBT)
+    // LayerStacks king bucket table path
+    Options.add("LS_KING_BUCKET_TABLE", Option("kingcolor9.json", [](const Option& o) {
+                    const std::string path = std::string(o);
+                    if (ls_king_bucket_table_path != path) {
+                        ls_king_bucket_table_path = path;
+                        eval_loaded = false;
+                    }
+                    return std::nullopt;
+                }));
+#elif defined(SFNNwoPSQT)
     // LayerStacks バケット選択モード
     Options.add("LS_BUCKET_MODE", Option("kingrank9", [](const Option& o) {
                     set_ls_bucket_mode(std::string(o));
@@ -366,7 +553,14 @@ namespace NNUE {
 	int FV_SCALE = 16; // 水匠5では24がベストらしいのでエンジンオプション"FV_SCALE"で変更可能にした。
 
     // NNUE評価関数パラメーター（共有メモリまたはローカルメモリ上に配置）
+#if defined(SFNNwoPSQT_KBT)
+    int kLayerStacks = 0;
+    LargePagePtr<NnueNetworks> network_storage;
+    SystemWideSharedConstant<FixedNnueNetworks> shared_fixed_networks;
+    bool use_fixed_network_storage = false;
+#else
     SystemWideSharedConstant<NnueNetworks> shared_networks;
+#endif
 
     // 評価関数ファイル名
     const char* const kFileName = EvalFileDefaultName;
@@ -410,8 +604,16 @@ namespace {
 	// テンポラリにパラメータを読み込み、共有メモリに配置する。
 	// 同じパラメータを持つ他プロセスが既に共有メモリを作成済みなら、そちらを参照する。
 	Tools::Result LoadAndShare(std::istream& stream) {
+#if defined(SFNNwoPSQT_KBT)
+		if (kLayerStacks <= 0) {
+			sync_cout << "info string LS_KING_BUCKET_TABLE must be loaded before NNUE parameters"
+				<< sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#else
 		// テンポラリ領域にパラメータを読み込む
 		auto tmp = make_unique_large_page<NnueNetworks>();
+#endif
 
 		std::uint32_t hash_value;
 		std::string architecture;
@@ -425,7 +627,7 @@ namespace {
 				<< sync_endl;
 		}
 
-#if defined(SFNNwoPSQT_V2)
+#if defined(SFNNwoPSQT_V2) || defined(SFNNwoPSQT_KBT)
 		// FV_SCALE をアーキテクチャ文字列から自動検出
 		{
 			auto pos = architecture.find("fv_scale=");
@@ -439,20 +641,60 @@ namespace {
 		}
 #endif
 
-		result = Detail::ReadParameters<FeatureTransformer>(stream, tmp->feature_transformer);
-		if (result.is_not_ok()) {
-			sync_cout << "info string NNUE feature params read failed: " << result.to_string() << sync_endl;
-			return result;
-		}
-		for (int i = 0; i < kLayerStacks; ++i) {
-			result = Detail::ReadParameters<Network>(stream, tmp->network[i]);
-			if (result.is_not_ok()) {
-				sync_cout << "info string NNUE network params read failed at stack " << i << ": " << result.to_string() << sync_endl;
-				return result;
+		auto read_parameters_into = [&](auto& target) -> Tools::Result {
+			Tools::Result read_result =
+				Detail::ReadParameters<FeatureTransformer>(stream, target.feature_transformer);
+			if (read_result.is_not_ok()) {
+				sync_cout << "info string NNUE feature params read failed: "
+					<< read_result.to_string() << sync_endl;
+				return read_result;
 			}
-		}
+			for (int i = 0; i < kLayerStacks; ++i) {
+				read_result = Detail::ReadParameters<Network>(stream, target.network[i]);
+				if (read_result.is_not_ok()) {
+					sync_cout << "info string NNUE network params read failed at stack "
+						<< i << ": " << read_result.to_string() << sync_endl;
+					return read_result;
+				}
+			}
+			return read_result;
+		};
 
-#if defined(SFNNwoPSQT_V2)
+#if defined(SFNNwoPSQT_KBT)
+		if (kLayerStacks == LayerStacks) {
+			auto tmp = make_unique_large_page<FixedNnueNetworks>();
+			result = read_parameters_into(*tmp);
+			if (result.is_not_ok()) return result;
+
+			shared_fixed_networks = SystemWideSharedConstant<FixedNnueNetworks>(*tmp);
+			network_storage.reset();
+			use_fixed_network_storage = true;
+
+			auto status = shared_fixed_networks.get_status();
+			if (status == SystemWideSharedConstantAllocationStatus::SharedMemory)
+				sync_cout << "info string NNUE shared memory: using shared memory (KBT fixed LayerStacks="
+					<< kLayerStacks << ")" << sync_endl;
+			else if (status == SystemWideSharedConstantAllocationStatus::LocalMemory)
+				sync_cout << "info string NNUE shared memory: fallback to local memory (KBT fixed LayerStacks="
+					<< kLayerStacks << ")" << sync_endl;
+		} else {
+			auto tmp = make_unique_large_page<NnueNetworks>();
+			tmp->network = make_unique_large_page<Network[]>(static_cast<size_t>(kLayerStacks));
+			result = read_parameters_into(*tmp);
+			if (result.is_not_ok()) return result;
+
+			network_storage = std::move(tmp);
+			use_fixed_network_storage = false;
+
+			sync_cout << "info string NNUE network storage: local memory (KBT dynamic LayerStacks="
+				<< kLayerStacks << ")" << sync_endl;
+		}
+#else
+		result = read_parameters_into(*tmp);
+		if (result.is_not_ok()) return result;
+#endif
+
+#if defined(SFNNwoPSQT_V2) || defined(SFNNwoPSQT_KBT)
 		if (stream && stream.peek() != std::ios::traits_type::eof())
 			sync_cout << "info string Warning: NNUE file has trailing data (ignored)" << sync_endl;
 #else
@@ -460,6 +702,7 @@ namespace {
 			return Tools::ResultCode::FileCloseError;
 #endif
 
+#if !defined(SFNNwoPSQT_KBT)
 		// 共有メモリに配置（同一ハッシュの共有メモリが既に存在すればそちらを参照）
 		shared_networks = SystemWideSharedConstant<NnueNetworks>(*tmp);
 
@@ -468,6 +711,7 @@ namespace {
 			sync_cout << "info string NNUE shared memory: using shared memory" << sync_endl;
 		else if (status == SystemWideSharedConstantAllocationStatus::LocalMemory)
 			sync_cout << "info string NNUE shared memory: fallback to local memory" << sync_endl;
+#endif
 
 		return Tools::ResultCode::Ok;
 	}
@@ -483,7 +727,7 @@ namespace {
 		if (!stream) return Tools::ResultCode::FileReadError;
 		if (version_out)
 			*version_out = version;
-#if defined(SFNNwoPSQT_V2)
+#if defined(SFNNwoPSQT_V2) || defined(SFNNwoPSQT_KBT)
         if (version != kVersion) {
 			sync_cout << "info string Warning: NNUE header version mismatch: expected " << kVersion
 				<< " got " << version << " (continuing anyway)" << sync_endl;
@@ -518,16 +762,16 @@ namespace {
     // 評価関数パラメータを書き込む
     bool WriteParameters(std::ostream& stream) {
         if (!WriteHeader(stream, kHashValue, GetArchitectureString())) return false;
-        if (!Detail::WriteParameters<FeatureTransformer>(stream, networks().feature_transformer)) return false;
+        if (!Detail::WriteParameters<FeatureTransformer>(stream, network_feature_transformer())) return false;
         for (int i = 0; i < kLayerStacks; ++i) {
-            if (!Detail::WriteParameters<Network>(stream, networks().network[i])) return false;
+            if (!Detail::WriteParameters<Network>(stream, network_at(i))) return false;
         }
         return !stream.fail();
     }
 
     // 差分計算ができるなら進める
     static void UpdateAccumulatorIfPossible(const Position& pos) {
-        networks().feature_transformer.UpdateAccumulatorIfPossible(pos);
+        network_feature_transformer().UpdateAccumulatorIfPossible(pos);
     }
 
 #if defined(SFNNwoPSQT)
@@ -536,7 +780,7 @@ namespace {
 
     // キャッシュ付き版: 差分計算ができるなら進める
     static void UpdateAccumulatorIfPossibleWithCache(const Position& pos) {
-        networks().feature_transformer.UpdateAccumulatorIfPossible(pos, tls_acc_cache);
+        network_feature_transformer().UpdateAccumulatorIfPossible(pos, tls_acc_cache);
     }
 
     // AccumulatorCaches を無効化する（新しい局面が設定されたときに呼ぶ）
@@ -551,6 +795,16 @@ namespace {
     // kingrank9 / kingcolor9 はルックアップテーブルで高速化。
     // 後手番のとき両玉を Inv(sq)=80-sq で先手視点に正規化してテーブルを共用する。
     static int stack_index_for_nnue(const Position& pos) {
+#if defined(SFNNwoPSQT_KBT)
+        const auto stm = pos.side_to_move();
+        const int stm_i = static_cast<int>(stm);
+        const int f_king = static_cast<int>(pos.square<KING>(stm));
+        const int e_king = static_cast<int>(pos.square<KING>(~stm));
+        int bucket = active_king_bucket_table[kbt_table_index(stm_i, f_king, e_king)];
+        if (bucket < 0) bucket = 0;
+        if (bucket >= kLayerStacks) bucket = kLayerStacks - 1;
+        return bucket;
+#else
         if (ls_bucket_mode == LSBucketMode::Progress8KPAbs && progress_kpabs_weights != nullptr) {
             int bucket = compute_progress8kpabs_bucket(pos);
             // progress8kpabs は 0..7 の 8バケット (LayerStacks=9 のうち 0..7 を使用)
@@ -564,6 +818,7 @@ namespace {
         const int f_king = static_cast<int>(pos.square<KING>(stm));
         const int e_king = static_cast<int>(pos.square<KING>(~stm));
         return static_cast<int>(active_king_pair_bucket_table->v[stm_i][f_king][e_king]);
+#endif
     }
 #endif
 
@@ -577,16 +832,16 @@ namespace {
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
 #if defined(SFNNwoPSQT)
-        networks().feature_transformer.Transform(pos, transformed_features, refresh, tls_acc_cache);
+        network_feature_transformer().Transform(pos, transformed_features, refresh, tls_acc_cache);
 #else
-        networks().feature_transformer.Transform(pos, transformed_features, refresh);
+        network_feature_transformer().Transform(pos, transformed_features, refresh);
 #endif
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
 #if defined(SFNNwoPSQT)
         const auto bucket = stack_index_for_nnue(pos);
-        const auto output = networks().network[bucket].Propagate(transformed_features, buffer);
+        const auto output = network_at(bucket).Propagate(transformed_features, buffer);
 #else
-        const auto output = networks().network[0].Propagate(transformed_features, buffer);
+        const auto output = network_at(0).Propagate(transformed_features, buffer);
 #endif
 
         // VALUE_MAX_EVALより大きな値が返ってくるとaspiration searchがfail highして
@@ -678,6 +933,17 @@ void load_eval() {
     if (!Options["SkipLoadingEval"])
 #endif
     {
+#if defined(SFNNwoPSQT_KBT)
+        const std::string table_path =
+            Path::Combine(Directory::GetBinaryFolder(), ls_king_bucket_table_path);
+        sync_cout << "info string loading LS_KING_BUCKET_TABLE : "
+                  << table_path << sync_endl;
+        if (!load_king_bucket_table_json(table_path)) {
+            sync_cout << "Error! : failed to read LS_KING_BUCKET_TABLE : "
+                      << table_path << sync_endl;
+            Tools::exit();
+        }
+#endif
         const std::string dir_name = Options["EvalDir"];
     #if !defined(__EMSCRIPTEN__)
 		const std::string file_name = NNUE::kFileName;

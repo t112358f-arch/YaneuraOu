@@ -81,8 +81,9 @@ void InitializeTraining(double eta1, u64 eta1_epoch,
 
   // 学習時は共有メモリ上のパラメーターをconst参照で取得する。
   // Trainer は内部でパラメーターのコピーを持つため、const_cast は不要。
-  auto& nn = networks();
-  trainer = Trainer<Network>::Create(const_cast<Network*>(&nn.network[0]), const_cast<FeatureTransformer*>(&nn.feature_transformer));
+  trainer = Trainer<Network>::Create(
+    const_cast<Network*>(&network_at(0)),
+    const_cast<FeatureTransformer*>(&network_feature_transformer()));
 
   if (Options["SkipLoadingEval"]) {
     trainer->Initialize(rng);
