@@ -14,7 +14,7 @@
 // ただし、この値を数値として使用することがあるので数値化できる文字列にしておく必要がある。
 #if !defined(ENGINE_VERSION)
 
-#define ENGINE_VERSION "9.40git"
+#define ENGINE_VERSION "9.60git"
 
 #endif
 // --------------------
@@ -188,23 +188,6 @@
 // これを4にすると、1つのTTEntryが64byteになる。いまどきのPCならCPUのcache line sizeが64byteであるため、
 // 速度低下はほぼないはず。
 //#define TT_CLUSTER_SIZE 3
-
-// ---------------------
-//  機械学習関連の設定
-// ---------------------
-
-
-// sfenを256bitにpackする機能、unpackする機能を有効にする。
-// これをdefineするとPosition::packe_sfen(),unpack_sfen()が使えるようになる。
-// ※　機械学習関連で局面の読み書きをする時に使う。
-// #define USE_SFEN_PACKER
-
-
-// 置換表のprobeに必ず失敗する設定
-// ※　 自己生成棋譜からの学習でqsearch()のPVが欲しいときに
-// 置換表にhitして枝刈りされたときにPVが得られないの悔しいので。
-// #define USE_FALSE_PROBE_IN_TT
-
 
 // ---------------------
 //  詰将棋ルーチン関係の設定
@@ -391,7 +374,6 @@ constexpr int MAX_PLY_NUM = 246;
 
 	// 定跡関連コマンド
 	#define ENABLE_MAKEBOOK_CMD
-	#define USE_SFEN_PACKER
 
 	#if defined(YANEURAOU_ENGINE_KPPT) || defined(YANEURAOU_ENGINE_KPP_KKPT) || defined(YANEURAOU_ENGINE_NNUE)
 		#define USE_DIFF_EVAL
@@ -411,8 +393,6 @@ constexpr int MAX_PLY_NUM = 246;
 	//#define USE_DEBUG_ASSERT
 
 	#define ENABLE_TEST_CMD
-	// 学習絡みのオプション。ybb形式の定跡読み込みでも使う。
-	#define USE_SFEN_PACKER
 
 	// 定跡生成絡み
 	#define ENABLE_MAKEBOOK_CMD
@@ -475,8 +455,6 @@ constexpr int MAX_PLY_NUM = 246;
 	#define USE_MATE_DFPN
 	#define USE_PIECE_VALUE
 	#define ENABLE_TEST_CMD
-	// 学習絡みのオプション。ybb形式の定跡読み込みでも使う。
-	#define USE_SFEN_PACKER
 
 	// 勝率の集計を行う型としてdouble型を用いる。
 	#define WIN_TYPE_DOUBLE
@@ -496,7 +474,6 @@ constexpr int MAX_PLY_NUM = 246;
 	#define USE_MATE_1PLY
 	//#define LONG_EFFECT_LIBRARY
 	#define ENABLE_TEST_CMD
-	#define USE_SFEN_PACKER
 #endif
 
 // --- やねうら王詰将棋エンジンとして実行ファイルを公開するとき用の設定集
@@ -513,7 +490,6 @@ constexpr int MAX_PLY_NUM = 246;
 	#define USE_MATE_DFPN
 	#define USE_PIECE_VALUE
 	#define ENABLE_TEST_CMD
-	#define USE_SFEN_PACKER
 #endif
 
 
@@ -524,7 +500,6 @@ constexpr int MAX_PLY_NUM = 246;
 	//#define USE_EVAL
 	//#define EVAL_MATERIAL
 	//#define USE_PIECE_VALUE
-	//#define USE_SFEN_PACKER
 #endif
 
 // --------------------
@@ -684,6 +659,10 @@ constexpr bool pretty_jp = false;
 	#define TARGET_CPU "SSSE3"
 	#elif defined(USE_SSE2)
 	#define TARGET_CPU "SSE2"
+	#elif defined(USE_NEON_DOTPROD)
+	#define TARGET_CPU "ARMV8_DOTPROD"
+	#elif defined(USE_NEON)
+	#define TARGET_CPU "ARMV8"
 	#else
 	#define TARGET_CPU "noSSE"
 	#endif

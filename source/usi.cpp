@@ -98,6 +98,10 @@ UCIEngine::UCIEngine(int argc, char** argv) :
 void USIEngine::set_engine(IEngine& _engine) {
     engine.set_engine(_engine);
 
+    // "engine_option_profile.txt"で、どのオプション群を生やすかを決める。
+    // これは"usi"応答より前に反映される必要がある。
+    engine.get_options().read_engine_option_profile("engine_option_profile.txt");
+
     // ⚠ やねうら王では、Engineのコンストラクタではoptionを生やさない設計に変更した。
     //     よって、派生classのadd_options()をここで明示的に呼び出してoptionを生やす必要がある。
     engine.add_options();
@@ -522,9 +526,19 @@ Search::LimitsType USIEngine::parse_limits(std::istream& is) {
 
 		if (token == "searchmoves")  // Needs to be the last command on the line
 			                         // この行の最後のコマンドである必要がある
+		{
 			// 残りの指し手すべてをsearchMovesに突っ込む。
 			while (is >> token)
+			{
+#if STOCKFISH
 				limits.searchmoves.push_back(to_lower(token));
+#else
+				// チェスUCIではsearchmovesを小文字化しても問題ないが、将棋USIでは
+				// "P*5e"のように打ち駒の駒種を大文字で表すので、大文字小文字を保持する。
+				limits.searchmoves.push_back(token);
+#endif
+			}
+		}
 
 		// 先手、後手の残り時間。[ms]
         else if (token == "wtime")
