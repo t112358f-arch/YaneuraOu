@@ -37,17 +37,18 @@ extern int FV_SCALE;
 namespace {
 
 // バケットモード
-enum class LSBucketMode { KingRank9, Progress8KPAbs };
+enum class LSBucketMode { KingRank9, Progress8KPAbs, Progress9KPAbs };
 LSBucketMode ls_bucket_mode = LSBucketMode::KingRank9;
 
-// progress8kpabs の重み (81 * fe_old_end floats)
+// progress8kpabs/progress9kpabs 共通の重み (81 * fe_old_end floats)
 // progress.bin = f64[81][fe_old_end], 読み込み時に f32 に変換
 constexpr int PROGRESS_KP_ABS_NUM_WEIGHTS = 81 * YaneuraOu::Eval::fe_old_end;
 float* progress_kpabs_weights = nullptr;
 
 // sigmoid(x)*8 = k となる x の閾値 (k=1..7)
 // x = ln(k / (8-k))
-constexpr float PROGRESS_BUCKET_THRESHOLDS[7] = {
+// progress8kpabs: 9バケット中0..7の8バケットしか使わない (歴史的経緯)。
+constexpr float PROGRESS8_BUCKET_THRESHOLDS[7] = {
     -1.9459101f, // ln(1/7)
     -1.0986123f, // ln(2/6)
     -0.5108256f, // ln(3/5)
@@ -57,16 +58,31 @@ constexpr float PROGRESS_BUCKET_THRESHOLDS[7] = {
      1.9459101f, // ln(7/1)
 };
 
-// progress_sum から bucket index (0..7) を計算
-inline int progress_sum_to_bucket(float sum) {
+// sigmoid(x)*9 = k となる x の閾値 (k=1..8)
+// x = ln(k / (9-k))
+// progress9kpabs: 9バケット (0..8) すべてを使う。
+constexpr float PROGRESS9_BUCKET_THRESHOLDS[8] = {
+    -2.1972246f, // ln(1/8)
+    -1.3862944f, // ln(2/7)
+    -0.8472979f, // ln(3/6)
+    -0.4054651f, // ln(4/5)
+     0.4054651f, // ln(5/4)
+     0.8472979f, // ln(6/3)
+     1.3862944f, // ln(7/2)
+     2.1972246f, // ln(8/1)
+};
+
+// progress_sum から bucket index を計算 (閾値テーブルの要素数+1バケット)
+template <size_t N>
+inline int progress_sum_to_bucket(float sum, const float (&thresholds)[N]) {
     int bucket = 0;
-    for (auto t : PROGRESS_BUCKET_THRESHOLDS)
+    for (auto t : thresholds)
         if (sum >= t) bucket++;
     return bucket;
 }
 
-// progress8kpabs の重み付き和を全駒スキャンで計算
-float compute_progress8kpabs_sum(const YaneuraOu::Position& pos) {
+// progress8kpabs/progress9kpabs 共通の重み付き和を全駒スキャンで計算
+float compute_progress_kpabs_sum(const YaneuraOu::Position& pos) {
     using namespace YaneuraOu;
     using namespace YaneuraOu::Eval;
 
@@ -85,10 +101,16 @@ float compute_progress8kpabs_sum(const YaneuraOu::Position& pos) {
     return sum;
 }
 
-// progress8kpabs バケット計算
+// progress8kpabs バケット計算 (0..7 の8バケット)
 int compute_progress8kpabs_bucket(const YaneuraOu::Position& pos) {
-    float sum = compute_progress8kpabs_sum(pos);
-    return progress_sum_to_bucket(sum);
+    float sum = compute_progress_kpabs_sum(pos);
+    return progress_sum_to_bucket(sum, PROGRESS8_BUCKET_THRESHOLDS);
+}
+
+// progress9kpabs バケット計算 (0..8 の9バケット)
+int compute_progress9kpabs_bucket(const YaneuraOu::Position& pos) {
+    float sum = compute_progress_kpabs_sum(pos);
+    return progress_sum_to_bucket(sum, PROGRESS9_BUCKET_THRESHOLDS);
 }
 
 // progress.bin を読み込む (f64[81][fe_old_end] -> f32)
@@ -197,6 +219,8 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
                     std::string mode = std::string(o);
                     if (mode == "progress8kpabs")
                         ls_bucket_mode = LSBucketMode::Progress8KPAbs;
+                    else if (mode == "progress9kpabs")
+                        ls_bucket_mode = LSBucketMode::Progress9KPAbs;
                     else
                         ls_bucket_mode = LSBucketMode::KingRank9;
                     return std::nullopt;
@@ -289,7 +313,11 @@ namespace NNUE {
     std::string GetArchitectureString() {
         const std::string base = "Features=" + FeatureTransformer::GetStructureString() +
 			",Network=" + Network::GetStructureString();
-#if defined(SFNNwoPSQT)
+#if defined(SFNNwoPSQT_V3)
+		// V3はNetwork 1個(network[0])に9bucket分を集約しているので、
+		// 表示上はkLayerStacks(==1)ではなくkNumBucketsを報告する。
+		return "ModelType=SFNNWithoutPsqt;" + base + "{LayerStack=" + std::to_string(kNumBuckets) + "}";
+#elif defined(SFNNwoPSQT)
 		return "ModelType=SFNNWithoutPsqt;" + base + "{LayerStack=" + std::to_string(kLayerStacks) + "}";
 #else
 		return base;
@@ -451,15 +479,33 @@ namespace {
     static void InvalidateAccumulatorCaches() {
         tls_acc_cache.invalidate();
     }
+    // 実際に選択しうるbucket数。
+    // 通常のSFNNwoPSQTアーキ (V1/V2) は NnueNetworks::network[] の要素数 (kLayerStacks)
+    // と一致する。SFNNwoP_V3 は9bucket分をNetwork 1個に集約しているため、
+    // kLayerStacks(==1)ではなくkNumBucketsを使う。
+#if defined(SFNNwoPSQT_V3)
+    constexpr int kBucketCount = kNumBuckets;
+#else
+    constexpr int kBucketCount = kLayerStacks;
+#endif
+
     // レイヤースタックの選択。
     // kingrank9: 双方の玉の段に応じて9通りに分岐させる。
-    // progress8kpabs: KP-absolute 進行度に応じて8通りに分岐させる。
+    // progress8kpabs: KP-absolute 進行度に応じて8通りに分岐させる (9バケット中0..7)。
+    // progress9kpabs: KP-absolute 進行度に応じて9通りに分岐させる (9バケット全部)。
     static int stack_index_for_nnue(const Position& pos) {
+        if (ls_bucket_mode == LSBucketMode::Progress9KPAbs && progress_kpabs_weights != nullptr) {
+            int bucket = compute_progress9kpabs_bucket(pos);
+            if (bucket < 0) bucket = 0;
+            if (bucket >= kBucketCount) bucket = kBucketCount - 1;
+            return bucket;
+        }
+
         if (ls_bucket_mode == LSBucketMode::Progress8KPAbs && progress_kpabs_weights != nullptr) {
             int bucket = compute_progress8kpabs_bucket(pos);
-            // progress8kpabs は 0..7 の 8バケット (LayerStacks=9 のうち 0..7 を使用)
+            // progress8kpabs は 0..7 の 8バケット (9バケットのうち 0..7 を使用)
             if (bucket < 0) bucket = 0;
-            if (bucket >= kLayerStacks) bucket = kLayerStacks - 1;
+            if (bucket >= kBucketCount) bucket = kBucketCount - 1;
             return bucket;
         }
 
@@ -473,7 +519,7 @@ namespace {
         const auto e_rank = stm == BLACK ? rank_of(Inv(e_king)) : rank_of(e_king);
         int idx = kFToIndex[f_rank] + kEToIndex[e_rank];
         if (idx < 0) idx = 0;
-        if (idx >= kLayerStacks) idx = kLayerStacks - 1;
+        if (idx >= kBucketCount) idx = kBucketCount - 1;
         return idx;
     }
 #endif
@@ -493,7 +539,12 @@ namespace {
         networks().feature_transformer.Transform(pos, transformed_features, refresh);
 #endif
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
-#if defined(SFNNwoPSQT)
+#if defined(SFNNwoPSQT_V3)
+        // V3: bucketごとに異なるl1/l2サイズを持つため9bucket分がNetwork 1個
+        // (network[0]) に集約されている。bucket選択はPropagate()の引数で行う。
+        const auto bucket = stack_index_for_nnue(pos);
+        const auto output = networks().network[0].Propagate(transformed_features, buffer, bucket);
+#elif defined(SFNNwoPSQT)
         const auto bucket = stack_index_for_nnue(pos);
         const auto output = networks().network[bucket].Propagate(transformed_features, buffer);
 #else

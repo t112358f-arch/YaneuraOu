@@ -18,6 +18,8 @@ print("NNUE architecture header generator by yaneurao V1.02 , 2026/01/31")
 parser = argparse.ArgumentParser(description="NNUEのarchitecture headerを生成する。")
 parser.add_argument('arch', type=str, nargs='?', default="halfkp_256x2-32-32", help="architectureを指定する。例) halfkp_1024x2-8-64, YANEURAOU_ENGINE_NNUE_HALFKP_1024X2_16_32とか")
 parser.add_argument('out_dir', type=str, nargs='?', default="", help="出力先のフォルダを指定する。例) /source/eval/nnue/architectures/")
+parser.add_argument('--l1', type=str, default="", help="SFNNwoP_V3専用。bucketごとのL1(kHidden1)サイズをカンマ区切り9個の自然数で指定する。例) 15,15,15,20,20,20,25,25,25")
+parser.add_argument('--l2', type=str, default="", help="SFNNwoP_V3専用。bucketごとのL2(kHidden2)サイズをカンマ区切り9個の自然数で指定する。例) 32,32,32,40,40,40,48,48,48")
 
 args = parser.parse_args()
 
@@ -32,8 +34,246 @@ arch = strip_prefix_ci(arch, "YANEURAOU_ENGINE_")
 arch = strip_prefix_ci(arch, "NNUE_")
 
 arch_upper_for_validation = arch.replace('-', '_').upper()
+
+# ============================================================
+#   SFNNwoP_V3: bucketごとにl1/l2のサイズを個別指定できるlayerstack
+# ============================================================
+#
+# 例) SFNNwoP_V3-1536 , SFNNwoP_V3 (ft省略時は1536)
+# LS_BUCKET_MODE (kingrank9 / progress8kpabs / progress9kpabs) はUSIオプションで
+# 実行時に切り替えるため、他のSFNNアーキテクチャのような "_k3k3" 等のbucket方式
+# suffixはarchitecture名に付けない。bucket数は常に9固定。
+NUM_BUCKETS_V3 = 9
+
+def _parse_bucket_list(csv: str, default: int, opt_name: str) -> list:
+    csv = csv.strip()
+    if csv == "":
+        return [default] * NUM_BUCKETS_V3
+    parts = [p.strip() for p in csv.split(',')]
+    if len(parts) != NUM_BUCKETS_V3:
+        print(f"Error! : {opt_name} must be {NUM_BUCKETS_V3} comma-separated natural numbers, got {len(parts)}: '{csv}'")
+        raise SystemExit(1)
+    values = []
+    for p in parts:
+        if not p.isdigit() or int(p) <= 0:
+            print(f"Error! : {opt_name} entries must be natural numbers (>0), got '{p}' in '{csv}'")
+            raise SystemExit(1)
+        values.append(int(p))
+    return values
+
+if arch_upper_for_validation.startswith("SFNNWOP_V3"):
+    rest = arch_upper_for_validation[len("SFNNWOP_V3"):].lstrip('_').lstrip('-')
+    ft_out_v3 = int(rest) if rest != "" else 1536
+    if ft_out_v3 <= 0 or ft_out_v3 % 128 != 0:
+        print(f"Error! : SFNNwoP_V3 ft (transformed feature dimensions) must be a positive multiple of 128, got {ft_out_v3}")
+        raise SystemExit(1)
+
+    l1_list = _parse_bucket_list(args.l1, 15, "--l1")
+    l2_list = _parse_bucket_list(args.l2, 32, "--l2")
+
+    filename = arch + ".h"
+    out_path = os.path.join(out_dir, filename)
+    print(f"output file path  : {out_path}")
+    print(f"architecture name : SFNNwoP_V3 (ft={ft_out_v3})")
+    print(f"per-bucket L1     : {l1_list}")
+    print(f"per-bucket L2     : {l2_list}")
+
+    guard = f"CLASSIC_NNUE_SFNNWOP_V3_{ft_out_v3}_H_INCLUDED"
+
+    def _bucket_hash(idx: int, l1: int, l2: int) -> int:
+        # bucketごとに一意な32bit hash (ファイル内容の妥当性チェックにのみ使用、
+        # 読み込み側は不一致でもwarningのみで継続する)。
+        h = 0x53464E33  # 'SFN3'
+        h = (h * 0x01000193 + ft_out_v3) & 0xFFFFFFFF
+        h = (h * 0x01000193 + l1) & 0xFFFFFFFF
+        h = (h * 0x01000193 + l2) & 0xFFFFFFFF
+        h = (h * 0x01000193 + idx) & 0xFFFFFFFF
+        return h
+
+    bucket_hashes = [_bucket_hash(i, l1_list[i], l2_list[i]) for i in range(NUM_BUCKETS_V3)]
+    combined_hash = 0x6333718A
+    for h in bucket_hashes:
+        combined_hash ^= h
+    combined_hash &= 0xFFFFFFFF
+
+    bucket_typedefs = "\n".join(
+        f"using NetworkBucket{i} = NetworkBucket<{l1_list[i]}, {l2_list[i]}, {bucket_hashes[i]}u>;"
+        for i in range(NUM_BUCKETS_V3)
+    )
+    bucket_members = "\n\t".join(f"NetworkBucket{i} b{i};" for i in range(NUM_BUCKETS_V3))
+    read_calls = "bool ok = " + "\n\t\t\t&& ".join(f"b{i}.ReadParameters(stream).is_ok()" for i in range(NUM_BUCKETS_V3)) + ";"
+    write_calls = "return " + "\n\t\t\t&& ".join(f"b{i}.WriteParameters(stream)" for i in range(NUM_BUCKETS_V3)) + ";"
+    buffer_size_expr = "std::max({" + ", ".join(f"NetworkBucket{i}::kBufferSize" for i in range(NUM_BUCKETS_V3)) + "})"
+    propagate_cases = "\n\t\t".join(
+        f"case {i}: return b{i}.Propagate(transformedFeatures, buffer);" for i in range(NUM_BUCKETS_V3)
+    )
+    l1_list_str = ",".join(str(v) for v in l1_list)
+    l2_list_str = ",".join(str(v) for v in l2_list)
+
+    header_v3 = f"""
+    // SFNNwoP_V3 : bucketごとに可変サイズのl1/l2を持つlayerstack architecture
+    // (nnue_arch_gen.pyにより自動生成)
+    //
+    // - ft_out はbucket間で共通 ({ft_out_v3})
+    // - l1/l2 はbucketごとに個別サイズ (--l1 / --l2 で指定)
+    // - bucket選択 (kingrank9 / progress8kpabs / progress9kpabs) はUSIオプション
+    //   LS_BUCKET_MODE で実行時に切り替える (architecture名には含めない)
+
+    #ifndef {guard}
+    #define {guard}
+
+    #include "../features/feature_set.h"
+    #include "../features/half_ka_hm2.h"
+
+    #include <cstring>
+    #include <algorithm>
+    #include <string>
+
+    #include "../layers/affine_transform_explicit.h"
+    #include "../layers/affine_transform_sparse_input_explicit.h"
+    #include "../layers/clipped_relu_explicit.h"
+    #include "../layers/sqr_clipped_relu.h"
+
+    namespace YaneuraOu {{
+    namespace Eval::NNUE {{
+
+    using RawFeatures = Features::FeatureSet<
+        Features::HalfKA_hm2<Features::Side::kFriend>>;
+
+    // 変換後の入力特徴量の次元数 (bucket間で共通)
+    constexpr IndexType kTransformedFeatureDimensions = {ft_out_v3};
+
+    // NnueNetworks::network[] の要素数。SFNNwoP_V3は9bucket分をNetwork 1個に
+    // 集約するので常に1。実際のbucket数はkNumBuckets。
+    constexpr int LayerStacks = 1;
+    constexpr int kNumBuckets = {NUM_BUCKETS_V3};
+
+    constexpr IndexType kInputDims = kTransformedFeatureDimensions;
+
+    // bucketごとのL1/L2出力次元 (参考情報として公開)
+    constexpr IndexType kHidden1DimsPerBucket[kNumBuckets] = {{ {l1_list_str} }};
+    constexpr IndexType kHidden2DimsPerBucket[kNumBuckets] = {{ {l2_list_str} }};
+
+    // 1bucket分のネットワーク。L1/L2サイズをtemplate引数化することでbucketごとに
+    // 異なるサイズを持たせられる。
+    template <IndexType kHidden1, IndexType kHidden2, std::uint32_t kHash>
+    struct NetworkBucket {{
+
+        Layers::AffineTransformSparseInputExplicit<kInputDims, kHidden1 + 1> fc_0;
+        Layers::ClippedReLUExplicit<kHidden1 + 1> ac_0;
+        Layers::SqrClippedReLU<kHidden1 + 1> ac_sqr_0;
+
+        Layers::AffineTransformExplicit<kHidden1 * 2, kHidden2> fc_1;
+        Layers::ClippedReLUExplicit<kHidden2> ac_1;
+
+        Layers::AffineTransformExplicit<kHidden2, 1> fc_2;
+
+        using OutputType = std::int32_t;
+        static constexpr IndexType kOutputDimensions = 1;
+
+        static constexpr std::uint32_t GetHashValue() {{ return kHash; }}
+
+        Tools::Result ReadParameters(std::istream& stream) {{
+            bool result = fc_0.ReadParameters(stream).is_ok()
+                && ac_0.ReadParameters(stream).is_ok()
+                && ac_sqr_0.ReadParameters(stream).is_ok()
+                && fc_1.ReadParameters(stream).is_ok()
+                && ac_1.ReadParameters(stream).is_ok()
+                && fc_2.ReadParameters(stream).is_ok();
+            return result ? Tools::ResultCode::Ok : Tools::ResultCode::FileReadError;
+        }}
+
+        bool WriteParameters(std::ostream& stream) const {{
+            return fc_0.WriteParameters(stream)
+                && ac_0.WriteParameters(stream)
+                && ac_sqr_0.WriteParameters(stream)
+                && fc_1.WriteParameters(stream)
+                && ac_1.WriteParameters(stream)
+                && fc_2.WriteParameters(stream);
+        }}
+
+        struct alignas(kCacheLineSize) Buffer {{
+            alignas(kCacheLineSize) typename decltype(fc_0)::OutputBuffer fc_0_out;
+            alignas(kCacheLineSize) typename decltype(ac_0)::OutputBuffer ac_0_out;
+            alignas(kCacheLineSize) typename decltype(ac_sqr_0)::OutputType ac_sqr_0_out[CeilToMultiple<IndexType>(kHidden1 * 2, 32)];
+            alignas(kCacheLineSize) typename decltype(fc_1)::OutputBuffer fc_1_out;
+            alignas(kCacheLineSize) typename decltype(ac_1)::OutputBuffer ac_1_out;
+            alignas(kCacheLineSize) typename decltype(fc_2)::OutputBuffer fc_2_out;
+        }};
+
+        static constexpr std::size_t kBufferSize = sizeof(Buffer);
+
+        const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, char* buffer) const {{
+            auto& buf = *reinterpret_cast<Buffer*>(buffer);
+
+            fc_0.Propagate(transformedFeatures, buf.fc_0_out);
+            ac_0.Propagate(buf.fc_0_out, buf.ac_0_out);
+            ac_sqr_0.Propagate(buf.fc_0_out, buf.ac_sqr_0_out);
+            std::memcpy(buf.ac_sqr_0_out + kHidden1, buf.ac_0_out,
+                kHidden1 * sizeof(typename decltype(ac_0)::OutputType));
+            fc_1.Propagate(buf.ac_sqr_0_out, buf.fc_1_out);
+            ac_1.Propagate(buf.fc_1_out, buf.ac_1_out);
+            fc_2.Propagate(buf.ac_1_out, buf.fc_2_out);
+
+            buf.fc_2_out[0] += buf.fc_0_out[kHidden1];
+
+            return buf.fc_2_out;
+        }}
+    }};
+
+    {bucket_typedefs}
+
+    // 9bucket分の集約。NnueNetworksからは常にnetwork[0]の1個として扱われ、
+    // 実際のbucket選択はPropagate()の引数(0..kNumBuckets-1)で行う。
+    struct Network {{
+
+        {bucket_members}
+
+        using OutputType = std::int32_t;
+        static constexpr IndexType kOutputDimensions = 1;
+
+        static constexpr std::uint32_t GetHashValue() {{
+            return {combined_hash}u;
+        }}
+
+        static std::string GetStructureString() {{
+            return "SFNNwoP-V3-{ft_out_v3}-L1[{l1_list_str}]-L2[{l2_list_str}]";
+        }}
+
+        Tools::Result ReadParameters(std::istream& stream) {{
+            {read_calls}
+            return ok ? Tools::ResultCode::Ok : Tools::ResultCode::FileReadError;
+        }}
+
+        bool WriteParameters(std::ostream& stream) const {{
+            {write_calls}
+        }}
+
+        static constexpr std::size_t kBufferSize = {buffer_size_expr};
+
+        const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, char* buffer, int bucket) const {{
+            switch (bucket) {{
+            {propagate_cases}
+            default:
+                return b0.Propagate(transformedFeatures, buffer);
+            }}
+        }}
+    }};
+
+    }}  // namespace Eval::NNUE
+    }}  // namespace YaneuraOu
+
+    #endif // {guard}
+    """
+
+    with open(out_path, "w", encoding='utf-8') as f:
+        f.write(dedent4(header_v3))
+
+    print("..done! (SFNNwoP_V3)")
+    raise SystemExit(0)
+
 if "SFNNWOP" in arch_upper_for_validation:
-    print("Error! : SFNNWOP architecture names are no longer supported. Use SFNN1536 or SFNN_..._k3k3 / SFNN_..._king3_by_king3.")
+    print("Error! : SFNNWOP architecture names are no longer supported. Use SFNN1536 or SFNN_..._k3k3 / SFNN_..._king3_by_king3 / SFNNwoP_V3-<ft>.")
     raise SystemExit(1)
 
 if "LS9" in arch_upper_for_validation.split('_'):

@@ -15,6 +15,14 @@
 # YANEURAOU_ENGINE_NNUE_HALFKP_1024X2_8_64 : NNUE型評価関数(halfkp_1024x2-8-64)
 # YANEURAOU_ENGINE_NNUE_HALFKP_VM_256X2_32_32 : NNUE型評価関数(halfkp_vm_256x2-32-32)
 # YANEURAOU_ENGINE_SFNN1536 : SFNN without PSQT 1536 (== YANEURAOU_ENGINE_SFNN_halfkahm2_1536_15_32_k3k3)
+# YANEURAOU_ENGINE_NNUE_SFNNwoP_V3-<ft> : SFNNwoP_V3 (bucketごとにl1/l2を個別サイズ指定できるlayerstack)
+#                                  例) YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoP_V3-1536
+#                                      NNUE_L1=15,15,15,20,20,20,25,25,25
+#                                      NNUE_L2=32,32,32,40,40,40,48,48,48
+#                                  ft_out はbucket間で共通、l1/l2 はカンマ区切り9個の自然数で
+#                                  bucketごとに個別指定 (未指定時はV2互換の15/32を9バケット分)。
+#                                  bucket選択方式 (kingrank9/progress8kpabs/progress9kpabs) は
+#                                  USIオプション LS_BUCKET_MODE で実行時に切り替える。
 # // ⇨ 上記以外のアーキテクチャのNNUE評価関数用のやねうら王をビルドしたい時は、
 # //   やねうら王のビルド手順 - やねうら王 Wiki
 # //   https://github.com/yaneurao/YaneuraOu/wiki/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E3%81%AE%E3%83%93%E3%83%AB%E3%83%89%E6%89%8B%E9%A0%86
@@ -111,11 +119,20 @@ ENGINE_ARCH_UPPER := $(shell printf '%s' '$(ENGINE_ARCH)' | tr '[:lower:]' '[:up
 NNUE_ARCH         := $(shell printf '%s' '$(ENGINE_ARCH)' | sed -E 's/^[Nn][Nn][Uu][Ee]_//')
 NNUE_ARCH_UPPER   := $(shell printf '%s' '$(NNUE_ARCH)' | tr '[:lower:]' '[:upper:]')
 IS_NNUE_EDITION   := $(filter NNUE NNUE_% SFNN%,$(ENGINE_ARCH_UPPER))
-INVALID_ENGINE_ARCH := $(strip $(findstring SFNNWOP,$(ENGINE_ARCH_UPPER)) $(findstring LS9,$(ENGINE_ARCH_UPPER)))
+# SFNNwoP_V3 (per-bucket可変サイズのlayerstack) だけは新規サポートなので
+# 「SFNNWOPは非サポート」判定から明示的に除外する。
+IS_SFNNWOP_V3        := $(filter SFNNWOP_V3%,$(NNUE_ARCH_UPPER))
+INVALID_ENGINE_ARCH := $(strip $(if $(IS_SFNNWOP_V3),,$(findstring SFNNWOP,$(ENGINE_ARCH_UPPER))) $(findstring LS9,$(ENGINE_ARCH_UPPER)))
 
 ifneq (,$(INVALID_ENGINE_ARCH))
-$(error Unsupported YANEURAOU_EDITION '$(YANEURAOU_EDITION)'. Use SFNN1536 or SFNN_..._k3k3 / SFNN_..._king3_by_king3)
+$(error Unsupported YANEURAOU_EDITION '$(YANEURAOU_EDITION)'. Use SFNN1536 or SFNN_..._k3k3 / SFNN_..._king3_by_king3 / SFNNwoP_V3-<ft>)
 endif
+
+# SFNNwoP_V3 の per-bucket L1/L2 サイズ (カンマ区切り9個の自然数)。
+# 例) NNUE_L1=15,15,15,20,20,20,25,25,25  NNUE_L2=32,32,32,40,40,40,48,48,48
+# 未指定時は nnue_arch_gen.py 側の既定値 (V2互換の 15/32 を9バケット分) が使われる。
+NNUE_L1 ?=
+NNUE_L2 ?=
 
 # エンジンの表示名 (engine displayname)
 # ("usi"コマンドに対して出力される)
@@ -443,6 +460,17 @@ ifneq (,$(IS_NNUE_EDITION))
 			CPPFLAGS += -DNNUE_ARCHITECTURE_HEADER=\"architectures/sfnnwop-1536-v2.h\"
 			CPPFLAGS += -DSFNNwoPSQT
 			CPPFLAGS += -DSFNNwoPSQT_V2
+
+		else ifneq (,$(IS_SFNNWOP_V3))
+			# SFNNwoP_V3: bucketごとにl1/l2のサイズを個別に指定できるlayerstack。
+			# 例) YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoP_V3-1536
+			#     NNUE_L1=15,15,15,20,20,20,25,25,25 NNUE_L2=32,32,32,40,40,40,48,48,48
+			ARCH_HEADER_FILE = \"architectures/$(NNUE_ARCH).h\"
+			CPPFLAGS += -DNNUE_ARCHITECTURE_HEADER=$(ARCH_HEADER_FILE)
+			CPPFLAGS += -DSFNNwoPSQT
+			CPPFLAGS += -DSFNNwoPSQT_V2
+			CPPFLAGS += -DSFNNwoPSQT_V3
+			ARCH_GEN_SCRIPT = $(PYTHON) eval/nnue/architectures/nnue_arch_gen.py $(NNUE_ARCH) eval/nnue/architectures --l1 "$(NNUE_L1)" --l2 "$(NNUE_L2)"
 		else
 			# 知らないNNUEのarchitectureなので、architecture headerを動的に生成する。
 			ARCH_HEADER_FILE = \"architectures/$(NNUE_ARCH).h\"
