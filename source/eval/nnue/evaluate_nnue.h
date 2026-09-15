@@ -72,6 +72,22 @@
 #ifndef NNUE_SFNN_PROGRESS_BUCKETS
 #define NNUE_SFNN_PROGRESS_BUCKETS 1
 #endif
+
+// router バケット (tatara `--bucket-mode ...routerkpabs<N>` / `...routerft<R>ft<R>`)。
+// routerkpabs / routerft<R>ft<R> は互いに排他 (同時使用不可)。詳細は
+// architectures/nnue_arch_gen.py のコメント、および tatara側 router_kpabs.rs /
+// router_ftbyft.rs を参照。
+#define NNUE_SFNN_ROUTER_MODE_NONE 0
+#define NNUE_SFNN_ROUTER_MODE_KPABS 1
+#define NNUE_SFNN_ROUTER_MODE_FTFT 2
+#ifndef NNUE_SFNN_ROUTER_MODE
+#define NNUE_SFNN_ROUTER_MODE NNUE_SFNN_ROUTER_MODE_NONE
+#endif
+// routerkpabsではバケット数そのもの (N)、routerft<R>ft<R>ではR (バケット数はR*R)。
+// router無しでは 0。
+#ifndef NNUE_SFNN_ROUTER_N
+#define NNUE_SFNN_ROUTER_N 0
+#endif
 #endif
 
 namespace YaneuraOu {
@@ -107,16 +123,85 @@ namespace Progress {
 } // namespace Progress
 #endif
 
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+namespace RouterKPAbs {
+
+	// SFNNのLayerStack選択に使う、学習可能なバケット選択ネットワーク (tatara
+	// `--bucket-mode ...routerkpabs<N>` / `router_kpabs.rs` 参照)。
+	// progress8kpabs (Progress::Parameters) と全く同じ計算方法 (KP-absolute特徴の
+	// 重み和、bias無し、Q16固定小数点) を N 出力 (N = NNUE_SFNN_ROUTER_N) に拡張したもの:
+	//     logits[k] = Σ_i w[i][k]   (i は active な KP-absolute index、bias無し)
+	//     bucket = argmax_k logits[k]
+	// nn.bin内ではFeatureTransformerの直後 (Progress::Parametersがあればその後) に
+	// このセクションを置く。
+	struct Parameters {
+		static constexpr int kN = NNUE_SFNN_ROUTER_N;
+
+		// BucketIndex() の k (=bucket候補) 方向の総和をTARGET_CPUのSIMD幅で
+		// 並列計算できるよう、出力方向をint32 SIMDレーン数の倍数に
+		// パディングする。**ファイル上のレイアウトはこのパディング無し
+		// (kN列のまま)** — ReadParameters/WriteParametersはkN列だけを
+		// 読み書きする。パディング列 (kN..kNPadded-1) はメモリ上にしか
+		// 存在せず常に0初期化 (BucketIndex()の最終argmaxはk<kNだけを見るので
+		// 計算結果に影響しない)。こうしておくことで、異なるTARGET_CPU向けに
+		// ビルドした実行ファイル間でも同じ .bin がそのまま読み込める
+		// (SIMD幅はビルド依存だが、ファイル上の重み列数はビルド非依存)。
+#if defined(USE_AVX512)
+		using RouterVec = __m512i;
+#elif defined(USE_AVX2)
+		using RouterVec = __m256i;
+#elif defined(USE_SSE2)
+		using RouterVec = __m128i;
+#elif defined(USE_NEON)
+		using RouterVec = int32x4_t;
+#else
+		// SIMD命令が使えないTARGET_CPU向け。幅1 (=スカラー) にパディング
+		// することで、後段のBucketIndex()を「幅1のSIMDループ」として
+		// 実装した1本のコードで、SIMD版/スカラー版を分岐なく共有できる。
+		using RouterVec = std::int32_t;
+#endif
+		static constexpr int kRouterSimdWidth = int(sizeof(RouterVec) / sizeof(std::int32_t));
+		static constexpr int kNPadded = CeilToMultiple<int>(kN, kRouterSimdWidth);
+
+		static constexpr std::uint32_t GetHashValue() {
+			return 0x6f52544bu; // "oRTK" : NNUE router (kpabs) parameter section
+		}
+
+		Tools::Result ReadParameters(std::istream& stream);
+		bool WriteParameters(std::ostream& stream) const;
+
+		// side to move / non side to move それぞれのKP-absolute特徴 (progress8kpabsと
+		// 同じピース列) の重み和を、bucket = 0..kN それぞれについて求め、argmaxを返す。
+		int BucketIndex(const Position& pos) const;
+
+		// 重み [sq][piece][bucket (0..kNPadded)] , bias無し。
+		// [kN, kNPadded) は常に0 (上記コメント参照)。
+		alignas(kCacheLineSize) std::int32_t weights_q16_[SQ_NB][Eval::fe_end][kNPadded] = {};
+	};
+
+} // namespace RouterKPAbs
+#endif
+
 	// Hash value of evaluation function structure
 	// 評価関数の構造のハッシュ値
 #if defined(SFNNwoPSQT)
 	constexpr std::uint32_t kSfnnBaseHashValue = 0x3c203b32u;
 #if NNUE_SFNN_PROGRESS_BUCKETS != 1
-	constexpr std::uint32_t kHashValue =
-	    kSfnnBaseHashValue ^ Progress::Parameters::GetHashValue();
+	constexpr std::uint32_t kProgressHashPart = Progress::Parameters::GetHashValue();
 #else
-	constexpr std::uint32_t kHashValue = kSfnnBaseHashValue;
+	constexpr std::uint32_t kProgressHashPart = 0u;
 #endif
+#if NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+	constexpr std::uint32_t kRouterHashPart = RouterKPAbs::Parameters::GetHashValue();
+#elif NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT
+	// routerft<R>ft<R> は専用のweightセクションを持たない (FeatureTransformerに同居する)
+	// ため、代わりに R をhashに混ぜてarchitectureの取り違えを検知する。
+	constexpr std::uint32_t kRouterHashPart = 0x6f465446u ^ static_cast<std::uint32_t>(NNUE_SFNN_ROUTER_N);
+#else
+	constexpr std::uint32_t kRouterHashPart = 0u;
+#endif
+	constexpr std::uint32_t kHashValue =
+	    kSfnnBaseHashValue ^ kProgressHashPart ^ kRouterHashPart;
 	constexpr int kLayerStacks = LayerStacks;
 #else
 	constexpr std::uint32_t kHashValue =
@@ -131,6 +216,10 @@ namespace Progress {
 		FeatureTransformer feature_transformer;
 #if defined(SFNNwoPSQT) && NNUE_SFNN_PROGRESS_BUCKETS != 1
 		Progress::Parameters progress;
+#endif
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+		// routerft<R>ft<R>は専用のweightを持たない (FeatureTransformerに同居するため)。
+		RouterKPAbs::Parameters router_kpabs;
 #endif
 		Network network[kLayerStacks];
 	};

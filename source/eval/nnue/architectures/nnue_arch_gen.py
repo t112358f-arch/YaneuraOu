@@ -5,6 +5,7 @@
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -111,14 +112,37 @@ layer_stack_hand_bucket_type = "0"
 layer_stack_king_buckets = "1"
 layer_stack_king_bucket_type = "0"
 layer_stack_progress_buckets = "1"
+layer_stack_router_name = "NONE"
+layer_stack_router_mode = "0"
+layer_stack_router_n = "0"
 sfnn_group_count = "1"
 sfnn_common_dims = "0"
 sfnn_shard_dims = "0"
 sfnn_common_shard = False
 
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_routerkpabs9 のように、末尾 (合成順に関わらず常に最後に
+    #    掛かる = 最下位桁) に routerkpabs<N> を置くと、tatara `--bucket-mode ...routerkpabs<N>`
+    #    で学習した net 用のビルドになる。ネットワーク構造自体は無印 (ls<N>相当) と同一で、
+    #    バケット「選択方式」だけが (hand/king/progressの合成値ではなく) 学習済みの
+    #    RouterKPAbs (KP-absolute特徴の重み和のargmax、tatara側 `router_kpabs.rs` 参照) になる。
+    #    hand/king/progressバケットと複合可能で、その場合は
+    #    「(hand/king/progressの合成バケット) * N + (routerkpabsの選択結果)」の順で合成する
+    #    (routerは常に最後 = 最下位桁)。
+    #
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_routerft8ft8 のように末尾に routerft<R>ft<R> (Rは正の整数、
+    #    末尾は"ft<R>"が2回連続) を置くと、tatara `--bucket-mode ...routerft<R>ft<R>` で学習した
+    #    net 用のビルドになる。この場合は routerkpabs と異なり **ネットワーク構造自体が変わる** —
+    #    FeatureTransformerの片視点あたりの (pairwise-multiply前の) accumulator幅が
+    #    `kInputDims + R` に広がる (router の生スコアR個がFTの同じaccumulator/重み行列に同居し、
+    #    評価関数本体のFTと一緒に差分計算される; 詳細は `nnue_feature_transformer.h` の
+    #    `TANUKI_ROUTER_ARCH_FTBYFT` 分岐を参照)。バケット数は R*R (STM側R通り×NSTM側R通りの
+    #    argmaxの組み合わせ)。hand/king/progressバケットと複合可能で、routerkpabsと同様に
+    #    常に最後 (最下位桁) に合成する。
+    #
+# 📝 routerkpabs と routerft<R>ft<R> は互いに排他 (同時指定不可)。router系は合計で最大1個。
 def parse_sfnn_layer_stack_spec(layer_stack_spec):
     if layer_stack_spec == "":
-        return "NONE", "1", "1", "0", "1", "0", "1"
+        return "NONE", "1", "1", "0", "1", "0", "1", "NONE", "1", "0"
 
     normalized = layer_stack_spec
     for long_name, short_name in {
@@ -141,6 +165,10 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
     king_name = ""
     king_type = 0
     progress_name = ""
+    router_name = ""
+    router_buckets = 1
+    # 0 = NNUE_SFNN_ROUTER_MODE_NONE, 1 = KPABS, 2 = FTFT
+    router_mode = 0
 
     hand_map = {
         "HAND4": (4, 1),
@@ -159,8 +187,12 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
         "K13K13Z": (13 * 13, 6),
     }
     progress_values = {2, 3, 4, 8, 16, 32}
+    router_kpabs_re = re.compile(r"^ROUTERKPABS(\d+)$")
+    router_ftft_re = re.compile(r"^ROUTERFT(\d+)FT(\d+)$")
 
     for token in [t for t in normalized.split("_") if t]:
+        m_kpabs = router_kpabs_re.match(token)
+        m_ftft = router_ftft_re.match(token)
         if token in hand_map:
             if hand_buckets != 1:
                 print(f"Error! : duplicate SFNN hand bucket in {layer_stack_spec}.")
@@ -183,17 +215,51 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
                 raise SystemExit(1)
             progress_name = token
             progress_buckets = int(raw)
+        elif m_kpabs:
+            if router_mode != 0:
+                print(f"Error! : router bucket (routerkpabs/routerft<R>ft<R>) may appear at most once in {layer_stack_spec}.")
+                raise SystemExit(1)
+            n = int(m_kpabs.group(1))
+            if n < 1:
+                print(f"Error! : routerkpabs<N> requires N >= 1 , got {token}.")
+                raise SystemExit(1)
+            router_name = token
+            router_mode = 1
+            router_buckets = n
+        elif m_ftft:
+            if router_mode != 0:
+                print(f"Error! : router bucket (routerkpabs/routerft<R>ft<R>) may appear at most once in {layer_stack_spec}.")
+                raise SystemExit(1)
+            r_a, r_b = int(m_ftft.group(1)), int(m_ftft.group(2))
+            if r_a != r_b:
+                print(f"Error! : routerft<R>ft<R> requires both R to match (got {token}).")
+                raise SystemExit(1)
+            if r_a < 1:
+                print(f"Error! : routerft<R>ft<R> requires R >= 1 , got {token}.")
+                raise SystemExit(1)
+            router_name = token
+            router_mode = 2
+            router_buckets = r_a * r_a
         else:
             print(f"Error! : unknown SFNN layer stack token {token} in {layer_stack_spec}.")
-            print("Error! : SFNN layer stack tokens are hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, and progress2/3/4/8/16/32.")
+            print("Error! : SFNN layer stack tokens are hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, and routerft<R>ft<R>.")
             raise SystemExit(1)
 
-    canonical = "_".join([name for name in [hand_name, king_name, progress_name] if name])
+    canonical = "_".join([name for name in [hand_name, king_name, progress_name, router_name] if name])
     if canonical == "":
         canonical = "NONE"
 
-    layer_count = hand_buckets * king_buckets * progress_buckets
-    return canonical, str(layer_count), str(hand_buckets), str(hand_type), str(king_buckets), str(king_type), str(progress_buckets)
+    # router は常に最後 (最下位桁) に合成するので、layer_count (=kLayerStacks) は
+    # hand*king*progress の積に router_buckets を最後に掛けたものになる。
+    layer_count = hand_buckets * king_buckets * progress_buckets * router_buckets
+    router_r = 0
+    if router_mode == 2:
+        # routerft<R>ft<R> の R (kRouterFtByFtR)。routerkpabs / router無しでは 0。
+        router_r = int(router_ftft_re.match(router_name).group(1))
+    router_n = router_buckets if router_mode == 1 else router_r
+    return (canonical, str(layer_count), str(hand_buckets), str(hand_type),
+        str(king_buckets), str(king_type), str(progress_buckets),
+        router_name if router_name else "NONE", str(router_mode), str(router_n))
 
 def sfnn_uses_shortcut(hidden1_dims: int) -> bool:
     if hidden1_dims % 8 == 7:
@@ -237,7 +303,9 @@ if arches[0].startswith("SFNN"):
     (layer_stack_name, layer_stack_count, layer_stack_hand_buckets,
         layer_stack_hand_bucket_type,
         layer_stack_king_buckets, layer_stack_king_bucket_type,
-        layer_stack_progress_buckets) = parse_sfnn_layer_stack_spec(layer_stack_spec)
+        layer_stack_progress_buckets,
+        layer_stack_router_name, layer_stack_router_mode,
+        layer_stack_router_n) = parse_sfnn_layer_stack_spec(layer_stack_spec)
 
     arches = [arches[1], arches[2], arches[3], arches[4], layer_stack_count]
 
@@ -465,10 +533,38 @@ if SFNN:
     if int(layers[0]) < 128:
         small_sfnn_ft_macro = "#define NNUE_SMALL_SFNN_FT"
 
+    # routerft<R>ft<R> のときだけ、FeatureTransformer側 (kTransformedFeatureDimensions =
+    # per-perspective, pre-pairwise-multiply の accumulator幅) が fc_0 の入力幅 (kInputDims)
+    # より kRouterFtByFtR (=R) だけ広くなる — router の生スコア R個 (perspectiveごと) が
+    # 同じ accumulator/重み行列に同居するため (詳細は nnue_feature_transformer.h の
+    # TANUKI_ROUTER_ARCH_FTBYFT 分岐を参照)。routerkpabs / router無しでは従来通り一致する。
+    router_is_ftft = layer_stack_router_mode == "2"
+    router_ft_r = int(layer_stack_router_n) if router_is_ftft else 0
+    main_dims = int(layers[0])
+    transformed_dims_value = main_dims + router_ft_r
+
+    router_macro_block = f"""
+        #define NNUE_SFNN_ROUTER_MODE_NONE 0
+        #define NNUE_SFNN_ROUTER_MODE_KPABS 1
+        #define NNUE_SFNN_ROUTER_MODE_FTFT 2
+        #define NNUE_SFNN_ROUTER_MODE {layer_stack_router_mode}
+        // routerkpabsではバケット数そのもの、routerft<R>ft<R>ではRを表す (バケット数はR*R)。
+        // 無印/router無しでは 0。
+        #define NNUE_SFNN_ROUTER_N {layer_stack_router_n}
+    """
+    if router_is_ftft:
+        router_macro_block += f"""
+        // `--bucket-mode ...routerft{{R}}ft{{R}}` (tatara) 用の net。FeatureTransformer の
+        // accumulator に同居する router の生スコア数 (perspectiveごとに R 個)。
+        // routerkpabs / router無しビルドでは定義しない (0扱い)。
+        #define TANUKI_ROUTER_ARCH_FTBYFT
+        constexpr IndexType kRouterFtByFtR = {router_ft_r};
+    """
+
     header += f"""
         // Number of input feature dimensions after conversion
         // 変換後の入力特徴量の次元数
-        constexpr IndexType kTransformedFeatureDimensions = {layers[0]};
+        constexpr IndexType kTransformedFeatureDimensions = {transformed_dims_value};
 
         // 小幅SFNN専用。従来幅のSFNNでは定義せず、既存の高速経路をそのまま使う。
         {small_sfnn_ft_macro}
@@ -481,6 +577,7 @@ if SFNN:
         #define NNUE_SFNN_KING_BUCKETS {layer_stack_king_buckets}
         #define NNUE_SFNN_KING_BUCKET_TYPE {layer_stack_king_bucket_type}
         #define NNUE_SFNN_PROGRESS_BUCKETS {layer_stack_progress_buckets}
+        {router_macro_block}
 
         // Number of groups for the first affine layer of SFNN.
         // common+shard fc_0でのみ2以上になる。
@@ -492,7 +589,9 @@ if SFNN:
         constexpr IndexType kHidden1ShardDimensions = {sfnn_shard_dims};
 
         // 各層の次元数
-        constexpr IndexType kInputDims   = kTransformedFeatureDimensions;
+        // routerft<R>ft<R> のときは kTransformedFeatureDimensions (FT accumulator幅) より
+        // R だけ狭い (router の生スコア分を除いた実際の特徴量次元)。それ以外は一致する。
+        constexpr IndexType kInputDims   = {main_dims};
         constexpr IndexType kHidden1Dims = {layers[1]};
         constexpr bool kUseShortcut = {"true" if hidden1_uses_shortcut else "false"};
         constexpr IndexType kHidden1OutputDims = kHidden1Dims + (kUseShortcut ? 1 : 0);

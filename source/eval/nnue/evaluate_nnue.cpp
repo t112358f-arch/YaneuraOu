@@ -243,6 +243,103 @@ int Parameters::BucketIndex(const Position& pos, int bucket_count) const {
 } // namespace Progress
 #endif
 
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+namespace RouterKPAbs {
+
+Tools::Result Parameters::ReadParameters(std::istream& stream) {
+	// ファイル上はkN列 (パディング無し) — kNPadded分のstrideではなく、
+	// 1行 (1 sq/piece あたり) kN 個ずつ読み、weights_q16_[sq][piece]の
+	// 先頭kN個に詰める (末尾 [kN, kNPadded) はメンバ初期化子の0のまま)。
+	constexpr int kFlatCount = int(SQ_NB) * int(Eval::fe_end) * kN;
+	std::vector<std::int32_t> flat(kFlatCount);
+	read_little_endian<std::int32_t>(stream, flat.data(), kFlatCount);
+	if (stream.fail())
+		return Tools::ResultCode::FileReadError;
+
+	int idx = 0;
+	for (int sq = 0; sq < int(SQ_NB); ++sq)
+		for (int p = 0; p < int(Eval::fe_end); ++p)
+			for (int k = 0; k < kN; ++k)
+				weights_q16_[sq][p][k] = flat[idx++];
+	return Tools::ResultCode::Ok;
+}
+
+bool Parameters::WriteParameters(std::ostream& stream) const {
+	// ReadParameters()と対称: パディング列 [kN, kNPadded) は書かない。
+	constexpr int kFlatCount = int(SQ_NB) * int(Eval::fe_end) * kN;
+	std::vector<std::int32_t> flat(kFlatCount);
+	int idx = 0;
+	for (int sq = 0; sq < int(SQ_NB); ++sq)
+		for (int p = 0; p < int(Eval::fe_end); ++p)
+			for (int k = 0; k < kN; ++k)
+				flat[idx++] = weights_q16_[sq][p][k];
+	stream.write(reinterpret_cast<const char*>(flat.data()),
+		sizeof(std::int32_t) * static_cast<size_t>(kFlatCount));
+	return !stream.fail();
+}
+
+// progress8kpabs (Progress::Parameters::Value0To255) と同じ特徴 (両perspectiveの
+// KP-absolute active feature) について、bias無しの重み和を bucket = 0..kN それぞれ
+// 求め、argmaxのbucketを返す。
+//
+// k (=bucket候補) 方向、kRouterSimdWidth個ずつをTARGET_CPUのSIMDで並列に累積する
+// (weights_q16_はkNPadded列にパディング済み — struct Parametersのコメント参照)。
+// 累積はint32で行う (PIECE_NUMBER_KING <= 38 なので両perspective合計で最大76項の
+// 和になるが、学習済みQ16.16重みの実用的な値域ではint32のオーバーフローは
+// 起きない想定。より安全側に振りたい場合はint64累積へ拡張すること)。
+int Parameters::BucketIndex(const Position& pos) const {
+	const auto sq_bk = pos.square<KING>(BLACK);
+	const auto sq_wk = Inv(pos.square<KING>(WHITE));
+
+	const auto& list0 = pos.eval_list()->piece_list_fb();
+	const auto& list1 = pos.eval_list()->piece_list_fw();
+
+	alignas(kCacheLineSize) std::int32_t logits[kNPadded] = {};
+	constexpr int kNumChunks = kNPadded / kRouterSimdWidth;
+
+	for (int i = 0; i < PIECE_NUMBER_KING; ++i) {
+		const std::int32_t* row_bk = &weights_q16_[sq_bk][list0[i]][0];
+		const std::int32_t* row_wk = &weights_q16_[sq_wk][list1[i]][0];
+		for (int c = 0; c < kNumChunks; ++c) {
+			const int off = c * kRouterSimdWidth;
+#if defined(USE_AVX512)
+			__m512i acc = _mm512_loadu_si512(reinterpret_cast<const void*>(&logits[off]));
+			acc = _mm512_add_epi32(acc, _mm512_loadu_si512(reinterpret_cast<const void*>(&row_bk[off])));
+			acc = _mm512_add_epi32(acc, _mm512_loadu_si512(reinterpret_cast<const void*>(&row_wk[off])));
+			_mm512_storeu_si512(reinterpret_cast<void*>(&logits[off]), acc);
+#elif defined(USE_AVX2)
+			__m256i acc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&logits[off]));
+			acc = _mm256_add_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&row_bk[off])));
+			acc = _mm256_add_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&row_wk[off])));
+			_mm256_storeu_si256(reinterpret_cast<__m256i*>(&logits[off]), acc);
+#elif defined(USE_SSE2)
+			__m128i acc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&logits[off]));
+			acc = _mm_add_epi32(acc, _mm_loadu_si128(reinterpret_cast<const __m128i*>(&row_bk[off])));
+			acc = _mm_add_epi32(acc, _mm_loadu_si128(reinterpret_cast<const __m128i*>(&row_wk[off])));
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(&logits[off]), acc);
+#elif defined(USE_NEON)
+			int32x4_t acc = vld1q_s32(&logits[off]);
+			acc = vaddq_s32(acc, vld1q_s32(&row_bk[off]));
+			acc = vaddq_s32(acc, vld1q_s32(&row_wk[off]));
+			vst1q_s32(&logits[off], acc);
+#else
+			// SIMD命令が使えないTARGET_CPU (kRouterSimdWidth == 1 のスカラー
+			// フォールバック)。
+			logits[off] += row_bk[off] + row_wk[off];
+#endif
+		}
+	}
+
+	int best = 0;
+	for (int k = 1; k < kN; ++k)
+		if (logits[k] > logits[best])
+			best = k;
+	return best;
+}
+
+} // namespace RouterKPAbs
+#endif
+
     // NNUE評価関数パラメーター（共有メモリまたはローカルメモリ上に配置）
     SystemWideSharedConstant<NnueNetworks> shared_networks;
 
@@ -315,6 +412,13 @@ namespace {
 			return result;
 		}
 #endif
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+		result = Detail::ReadParameters<RouterKPAbs::Parameters>(stream, tmp->router_kpabs);
+		if (result.is_not_ok()) {
+			sync_cout << "info string NNUE router(kpabs) params read failed: " << result.to_string() << sync_endl;
+			return result;
+		}
+#endif
 		for (int i = 0; i < kLayerStacks; ++i) {
 			result = Detail::ReadParameters<Network>(stream, tmp->network[i]);
 			if (result.is_not_ok()) {
@@ -375,6 +479,9 @@ namespace {
 #if defined(SFNNwoPSQT) && NNUE_SFNN_PROGRESS_BUCKETS != 1
         if (!Detail::WriteParameters<Progress::Parameters>(stream, networks().progress)) return false;
 #endif
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+        if (!Detail::WriteParameters<RouterKPAbs::Parameters>(stream, networks().router_kpabs)) return false;
+#endif
         for (int i = 0; i < kLayerStacks; ++i) {
             if (!Detail::WriteParameters<Network>(stream, networks().network[i])) return false;
         }
@@ -418,8 +525,20 @@ namespace {
         || NNUE_SFNN_PROGRESS_BUCKETS == 8 || NNUE_SFNN_PROGRESS_BUCKETS == 16
         || NNUE_SFNN_PROGRESS_BUCKETS == 32,
         "unsupported NNUE_SFNN_PROGRESS_BUCKETS");
-    static_assert(kLayerStacks == NNUE_SFNN_HAND_BUCKETS * NNUE_SFNN_KING_BUCKETS * NNUE_SFNN_PROGRESS_BUCKETS,
-        "LayerStacks must match the SFNN bucket product");
+    static_assert(NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE
+        || NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+        || NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT,
+        "unsupported NNUE_SFNN_ROUTER_MODE");
+    static_assert(NNUE_SFNN_ROUTER_MODE != NNUE_SFNN_ROUTER_MODE_NONE || NNUE_SFNN_ROUTER_N == 0,
+        "NNUE_SFNN_ROUTER_N must be 0 when router is disabled");
+    static_assert(NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE || NNUE_SFNN_ROUTER_N >= 1,
+        "NNUE_SFNN_ROUTER_N must be >= 1 when router is enabled");
+    // routerkpabsではNNUE_SFNN_ROUTER_Nがそのままbucket数、routerft<R>ft<R>ではR*R。
+    static_assert(kLayerStacks == NNUE_SFNN_HAND_BUCKETS * NNUE_SFNN_KING_BUCKETS * NNUE_SFNN_PROGRESS_BUCKETS
+        * (NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS ? NNUE_SFNN_ROUTER_N
+           : NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT ? NNUE_SFNN_ROUTER_N * NNUE_SFNN_ROUTER_N
+           : 1),
+        "LayerStacks must match the SFNN bucket product (hand * king * progress * router, router last)");
 
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int king3_by_king3_bucket(const Position& pos) {
@@ -655,8 +774,36 @@ namespace {
 #endif
     }
 
+#if NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+    // routerkpabs<N> : 学習済みRouterKPAbsのargmaxで1つのbucket (0..N-1) を選ぶ。
+    static int router_kpabs_bucket(const Position& pos) {
+        return networks().router_kpabs.BucketIndex(pos);
+    }
+#elif NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT
+    // routerft<R>ft<R> : FeatureTransformerのaccumulatorに同居するrouterの生スコア
+    // (perspectiveごとにR個) から、STM側/NSTM側それぞれargmaxを取り、R*R通りに combine する。
+    // (tatara側 `router_ftbyft.rs` 参照)
+    static int router_ftft_bucket(const Position& pos) {
+        // Transform()と同じく、差分計算を進めてからaccumulatorを直接読む。
+        networks().feature_transformer.UpdateAccumulatorIfPossible(pos);
+        const Color perspectives[2] = { pos.side_to_move(), ~pos.side_to_move() };
+        int sub_bucket[2];
+        for (int p = 0; p < 2; ++p) {
+            FeatureTransformer::BiasType raw[NNUE_SFNN_ROUTER_N];
+            networks().feature_transformer.RouterRawScores(pos, perspectives[p], raw);
+            int best = 0;
+            for (int k = 1; k < NNUE_SFNN_ROUTER_N; ++k)
+                if (raw[k] > raw[best])
+                    best = k;
+            sub_bucket[p] = best;
+        }
+        // p=0がSTM、p=1がNSTM。STM側を上位桁とする。
+        return sub_bucket[0] * NNUE_SFNN_ROUTER_N + sub_bucket[1];
+    }
+#endif
+
     static int stack_index_for_nnue(const Position& pos) {
-#if NNUE_SFNN_HAND_BUCKETS == 1 && NNUE_SFNN_KING_BUCKETS == 9 && NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3 && NNUE_SFNN_PROGRESS_BUCKETS == 1
+#if NNUE_SFNN_HAND_BUCKETS == 1 && NNUE_SFNN_KING_BUCKETS == 9 && NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3 && NNUE_SFNN_PROGRESS_BUCKETS == 1 && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE
         return king3_by_king3_bucket(pos);
 #else
         int idx = 0;
@@ -691,6 +838,14 @@ namespace {
 
 #if NNUE_SFNN_PROGRESS_BUCKETS != 1
         idx = idx * NNUE_SFNN_PROGRESS_BUCKETS + progress_bucket(pos);
+#endif
+
+        // router系 (routerkpabs / routerft<R>ft<R>) は、hand/king/progressの合成が
+        // 終わった後、常に最後 (最下位桁) に合成する。
+#if NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+        idx = idx * NNUE_SFNN_ROUTER_N + router_kpabs_bucket(pos);
+#elif NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT
+        idx = idx * (NNUE_SFNN_ROUTER_N * NNUE_SFNN_ROUTER_N) + router_ftft_bucket(pos);
 #endif
 
         if (idx < 0) idx = 0;
