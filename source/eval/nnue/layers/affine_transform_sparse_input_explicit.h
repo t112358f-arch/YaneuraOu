@@ -579,6 +579,121 @@ public:
 #endif
         }
 
+        // WSB (WithSharedBucket) 用: fc_0 (FT出力 -> Hidden1) を2つのbucket
+        // (`*this` と `other`) に対してforwardする。この層は疎入力
+        // (`find_nnz_explicit`でゼロでない4byte block だけ列挙してから積和する)
+        // なので、Propagate()を2回呼ぶと **同じ入力に対する同じ nnz 列挙が
+        // 2回重複する** (入力はbucketに依らず同じFT出力/ac_sqr_0_out、nnz は
+        // 入力だけで決まりweightsには依らないため)。nnz 列挙とその後の入力
+        // 展開 (`_mm512_set1_epi32`) を1回にまとめ、`*this`と`other`の重み列への
+        // 積和だけを同じループ内で2本走らせることで、この重複を無くす。
+        // 数値結果は `Propagate(input, output); other.Propagate(input,
+        // otherOutput);` を別々に呼んだ場合と完全に一致する。
+        void PropagatePair(const InputType* input,
+                            const AffineTransformSparseInputExplicit& other,
+                            OutputType* output,
+                            OutputType* otherOutput) const {
+#if defined(USE_SSSE3) || USE_NEON >= 8
+#if defined(USE_AVX512)
+        if constexpr (kOutputDimensions % 16 == 0)
+        {
+            constexpr IndexType kNumChunks = CeilToMultiple<IndexType>(kInputDimensions, 8) / kChunkSize;
+            constexpr IndexType kNumRegs   = kOutputDimensions / 16;
+            std::uint16_t       nnz[kNumChunks];
+            IndexType           count;
+
+            const auto input32 = reinterpret_cast<const std::int32_t*>(input);
+
+            find_nnz_explicit<kNumChunks>(input32, nnz, count);
+
+            const __m512i* biasvec = reinterpret_cast<const __m512i*>(biases_);
+            const __m512i* otherBiasvec = reinterpret_cast<const __m512i*>(other.biases_);
+            __m512i        acc[kNumRegs];
+            __m512i        accOther[kNumRegs];
+
+            for (IndexType k = 0; k < kNumRegs; ++k) {
+                acc[k] = biasvec[k];
+                accOther[k] = otherBiasvec[k];
+            }
+
+            for (IndexType j = 0; j < count; ++j)
+            {
+                const auto    i  = nnz[j];
+                const __m512i in = _mm512_set1_epi32(input32[i]);
+                const auto    col =
+                    reinterpret_cast<const __m512i*>(&weights_[i * kOutputDimensions * kChunkSize]);
+                const auto    colOther =
+                    reinterpret_cast<const __m512i*>(&other.weights_[i * kOutputDimensions * kChunkSize]);
+                for (IndexType k = 0; k < kNumRegs; ++k) {
+                    Simd::m512_add_dpbusd_epi32(acc[k], in, col[k]);
+                    Simd::m512_add_dpbusd_epi32(accOther[k], in, colOther[k]);
+                }
+            }
+
+            __m512i* outptr = reinterpret_cast<__m512i*>(output);
+            __m512i* otherOutptr = reinterpret_cast<__m512i*>(otherOutput);
+
+            for (IndexType k = 0; k < kNumRegs; ++k) {
+                outptr[k] = acc[k];
+                otherOutptr[k] = accOther[k];
+            }
+            return;
+        }
+#endif
+
+#if defined(USE_AVX2)
+        if constexpr (kOutputDimensions % 8 == 0)
+        {
+            constexpr IndexType kNumChunks = CeilToMultiple<IndexType>(kInputDimensions, 8) / kChunkSize;
+            constexpr IndexType kNumRegs   = kOutputDimensions / 8;
+            std::uint16_t       nnz[kNumChunks];
+            IndexType           count;
+
+            const auto input32 = reinterpret_cast<const std::int32_t*>(input);
+
+            find_nnz_explicit<kNumChunks>(input32, nnz, count);
+
+            const __m256i* biasvec = reinterpret_cast<const __m256i*>(biases_);
+            const __m256i* otherBiasvec = reinterpret_cast<const __m256i*>(other.biases_);
+            __m256i        acc[kNumRegs];
+            __m256i        accOther[kNumRegs];
+
+            for (IndexType k = 0; k < kNumRegs; ++k) {
+                acc[k] = biasvec[k];
+                accOther[k] = otherBiasvec[k];
+            }
+
+            for (IndexType j = 0; j < count; ++j)
+            {
+                const auto    i  = nnz[j];
+                const __m256i in = _mm256_set1_epi32(input32[i]);
+                const auto    col =
+                    reinterpret_cast<const __m256i*>(&weights_[i * kOutputDimensions * kChunkSize]);
+                const auto    colOther =
+                    reinterpret_cast<const __m256i*>(&other.weights_[i * kOutputDimensions * kChunkSize]);
+                for (IndexType k = 0; k < kNumRegs; ++k) {
+                    Simd::m256_add_dpbusd_epi32(acc[k], in, col[k]);
+                    Simd::m256_add_dpbusd_epi32(accOther[k], in, colOther[k]);
+                }
+            }
+
+            __m256i* outptr = reinterpret_cast<__m256i*>(output);
+            __m256i* otherOutptr = reinterpret_cast<__m256i*>(otherOutput);
+
+            for (IndexType k = 0; k < kNumRegs; ++k) {
+                outptr[k] = acc[k];
+                otherOutptr[k] = accOther[k];
+            }
+            return;
+        }
+#endif
+#endif
+            // 融合SIMDパス (AVX512/AVX2) が無い環境/出力幅ではフォールバックする
+            // (正しさは保つ — nnz 列挙の共有による高速化だけが効かない)。
+            Propagate(input, output);
+            other.Propagate(input, otherOutput);
+        }
+
    private:
         using BiasType   = OutputType;
         using WeightType = std::int8_t;

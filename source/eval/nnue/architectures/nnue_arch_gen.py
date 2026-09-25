@@ -104,6 +104,9 @@ if len(arches) <= 3 :
 #     SFNN_halfka2_1024_7_64_hand16_k3k3 / hand64z_k9k9 / hand64z_k13k13z / hand64z_k21k21 / hand64z_k29k29 のように、
 #     hand bucketと複合できる。
 #     SFNN_halfka2_1024_7_64_k3k3_progress8 のようにprogress2/3/4/8/16/32とも複合できる。
+#     SFNN_halfka2_1024_7_64_k3k3_wsb のように、バケット名の最後にwsb (WithSharedBucket)
+#     を置くと、常に選ばれる共有バケットを1個追加してバケット数をN+1にし、選択された
+#     1バケットと共有バケットの出力平均を評価値にする。
 SFNN = False
 layer_stack_name = ""
 layer_stack_count = ""
@@ -115,6 +118,7 @@ layer_stack_progress_buckets = "1"
 layer_stack_router_name = "NONE"
 layer_stack_router_mode = "0"
 layer_stack_router_n = "0"
+layer_stack_shared_bucket = "0"
 sfnn_group_count = "1"
 sfnn_common_dims = "0"
 sfnn_shard_dims = "0"
@@ -139,10 +143,22 @@ sfnn_common_shard = False
     #    argmaxの組み合わせ)。hand/king/progressバケットと複合可能で、routerkpabsと同様に
     #    常に最後 (最下位桁) に合成する。
     #
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_progress8_wsb のように、バケット名の最後に
+    #    wsb (WithSharedBucket) を置くと、hand/king/progress/router の合成バケット数
+    #    (=N) に「常に選ばれる共有バケット」を1個追加して N+1 バケットの net にする。
+    #    共有バケットの重み (LayerStack配列の末尾、index N) は局面に関わらず常に
+    #    forward され、通常どおり選択された1バケット (index 0..N-1) と共有バケット
+    #    (index N) の出力を平均したものが評価値になる (`evaluate_nnue.cpp` の
+    #    `ComputeScore` 参照)。バケット「選択方式」自体 (hand/king/progress/router) は
+    #    無印と変わらない。wsb はどのトークンとも複合できるが、常に最後 (最下位の
+    #    合成順ではなく、文字列上も最後) に置く必要がある。
+    #
 # 📝 routerkpabs と routerft<R>ft<R> は互いに排他 (同時指定不可)。router系は合計で最大1個。
+# 📝 wsb は他の全トークンと複合可能 (排他なし)。ただしバケット名の最後のトークンでなければ
+#    ならない (末尾以外に置くとエラー)。
 def parse_sfnn_layer_stack_spec(layer_stack_spec):
     if layer_stack_spec == "":
-        return "NONE", "1", "1", "0", "1", "0", "1", "NONE", "1", "0"
+        return "NONE", "1", "1", "0", "1", "0", "1", "NONE", "1", "0", "0"
 
     normalized = layer_stack_spec
     for long_name, short_name in {
@@ -169,6 +185,7 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
     router_buckets = 1
     # 0 = NNUE_SFNN_ROUTER_MODE_NONE, 1 = KPABS, 2 = FTFT
     router_mode = 0
+    shared_bucket = 0
 
     hand_map = {
         "HAND4": (4, 1),
@@ -190,10 +207,16 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
     router_kpabs_re = re.compile(r"^ROUTERKPABS(\d+)$")
     router_ftft_re = re.compile(r"^ROUTERFT(\d+)FT(\d+)$")
 
-    for token in [t for t in normalized.split("_") if t]:
+    tokens = [t for t in normalized.split("_") if t]
+    for pos, token in enumerate(tokens):
         m_kpabs = router_kpabs_re.match(token)
         m_ftft = router_ftft_re.match(token)
-        if token in hand_map:
+        if token == "WSB":
+            if pos != len(tokens) - 1:
+                print(f"Error! : wsb (WithSharedBucket) must be the last token in {layer_stack_spec}.")
+                raise SystemExit(1)
+            shared_bucket = 1
+        elif token in hand_map:
             if hand_buckets != 1:
                 print(f"Error! : duplicate SFNN hand bucket in {layer_stack_spec}.")
                 raise SystemExit(1)
@@ -242,16 +265,21 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
             router_buckets = r_a * r_a
         else:
             print(f"Error! : unknown SFNN layer stack token {token} in {layer_stack_spec}.")
-            print("Error! : SFNN layer stack tokens are hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, and routerft<R>ft<R>.")
+            print("Error! : SFNN layer stack tokens are hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, routerft<R>ft<R>, and wsb.")
             raise SystemExit(1)
 
     canonical = "_".join([name for name in [hand_name, king_name, progress_name, router_name] if name])
     if canonical == "":
         canonical = "NONE"
+    if shared_bucket:
+        # wsb は文字列上も常に最後に置く (上のtoken loopで既に位置を検証済み)。
+        canonical = canonical + "_WSB" if canonical != "NONE" else "WSB"
 
     # router は常に最後 (最下位桁) に合成するので、layer_count (=kLayerStacks) は
     # hand*king*progress の積に router_buckets を最後に掛けたものになる。
-    layer_count = hand_buckets * king_buckets * progress_buckets * router_buckets
+    # wsb はその積に対して「常に選ばれる共有バケット」を1個追加するので、最後に+1する
+    # (共有バケットの index は必ず layer_count-1 = 合成後バケット数そのもの)。
+    layer_count = hand_buckets * king_buckets * progress_buckets * router_buckets + shared_bucket
     router_r = 0
     if router_mode == 2:
         # routerft<R>ft<R> の R (kRouterFtByFtR)。routerkpabs / router無しでは 0。
@@ -259,7 +287,8 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
     router_n = router_buckets if router_mode == 1 else router_r
     return (canonical, str(layer_count), str(hand_buckets), str(hand_type),
         str(king_buckets), str(king_type), str(progress_buckets),
-        router_name if router_name else "NONE", str(router_mode), str(router_n))
+        router_name if router_name else "NONE", str(router_mode), str(router_n),
+        str(shared_bucket))
 
 def sfnn_uses_shortcut(hidden1_dims: int) -> bool:
     if hidden1_dims % 8 == 7:
@@ -305,7 +334,8 @@ if arches[0].startswith("SFNN"):
         layer_stack_king_buckets, layer_stack_king_bucket_type,
         layer_stack_progress_buckets,
         layer_stack_router_name, layer_stack_router_mode,
-        layer_stack_router_n) = parse_sfnn_layer_stack_spec(layer_stack_spec)
+        layer_stack_router_n,
+        layer_stack_shared_bucket) = parse_sfnn_layer_stack_spec(layer_stack_spec)
 
     arches = [arches[1], arches[2], arches[3], arches[4], layer_stack_count]
 
@@ -578,6 +608,13 @@ if SFNN:
         #define NNUE_SFNN_KING_BUCKET_TYPE {layer_stack_king_bucket_type}
         #define NNUE_SFNN_PROGRESS_BUCKETS {layer_stack_progress_buckets}
         {router_macro_block}
+
+        // wsb (WithSharedBucket)。1のとき、LayerStacks (={layers[3]}) の末尾index
+        // (=LayerStacks-1) は hand/king/progress/routerの選択に関わらず常に評価される
+        // 共有バケットで、選択された1バケットとの出力平均を評価値にする
+        // (`evaluate_nnue.cpp` の `ComputeScore` 参照)。0なら従来通り選択された1バケット
+        // のみを使う。
+        #define NNUE_SFNN_USE_SHARED_BUCKET {layer_stack_shared_bucket}
 
         // Number of groups for the first affine layer of SFNN.
         // common+shard fc_0でのみ2以上になる。

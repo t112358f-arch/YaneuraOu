@@ -534,11 +534,14 @@ namespace {
     static_assert(NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE || NNUE_SFNN_ROUTER_N >= 1,
         "NNUE_SFNN_ROUTER_N must be >= 1 when router is enabled");
     // routerkpabsではNNUE_SFNN_ROUTER_Nがそのままbucket数、routerft<R>ft<R>ではR*R。
+    // wsb (NNUE_SFNN_USE_SHARED_BUCKET) は選択方式に関わらず常に評価される共有バケット
+    // を末尾に1個追加するので、積の後に+1する。
     static_assert(kLayerStacks == NNUE_SFNN_HAND_BUCKETS * NNUE_SFNN_KING_BUCKETS * NNUE_SFNN_PROGRESS_BUCKETS
         * (NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS ? NNUE_SFNN_ROUTER_N
            : NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT ? NNUE_SFNN_ROUTER_N * NNUE_SFNN_ROUTER_N
-           : 1),
-        "LayerStacks must match the SFNN bucket product (hand * king * progress * router, router last)");
+           : 1)
+        + (NNUE_SFNN_USE_SHARED_BUCKET ? 1 : 0),
+        "LayerStacks must match the SFNN bucket product (hand * king * progress * router, router last) plus 1 when wsb is enabled");
 
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int king3_by_king3_bucket(const Position& pos) {
@@ -802,8 +805,16 @@ namespace {
     }
 #endif
 
+    // 選択バケット (0..kBaseBuckets-1) の個数。wsb有効時は共有バケット (末尾1個) を
+    // 含まないので kLayerStacks - 1、無効時は kLayerStacks そのもの。
+#if NNUE_SFNN_USE_SHARED_BUCKET
+    static constexpr int kBaseBuckets = kLayerStacks - 1;
+#else
+    static constexpr int kBaseBuckets = kLayerStacks;
+#endif
+
     static int stack_index_for_nnue(const Position& pos) {
-#if NNUE_SFNN_HAND_BUCKETS == 1 && NNUE_SFNN_KING_BUCKETS == 9 && NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3 && NNUE_SFNN_PROGRESS_BUCKETS == 1 && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE
+#if NNUE_SFNN_HAND_BUCKETS == 1 && NNUE_SFNN_KING_BUCKETS == 9 && NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3 && NNUE_SFNN_PROGRESS_BUCKETS == 1 && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE && !NNUE_SFNN_USE_SHARED_BUCKET
         return king3_by_king3_bucket(pos);
 #else
         int idx = 0;
@@ -849,7 +860,7 @@ namespace {
 #endif
 
         if (idx < 0) idx = 0;
-        if (idx >= kLayerStacks) idx = kLayerStacks - 1;
+        if (idx >= kBaseBuckets) idx = kBaseBuckets - 1;
         return idx;
 #endif
     }
@@ -865,21 +876,57 @@ namespace {
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
 #if defined(SFNNwoPSQT)
         const auto bucket = stack_index_for_nnue(pos);
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // 選択bucketと共有bucket (index kSharedBucketIndex) の中間活性を同時に
+        // 保持する必要があるため、`buffer`とは別にもう1つ確保する
+        // (`PropagatePair`/`PropagatePairFromAccumulator`はこの2つに書き込む)。
+        alignas(kCacheLineSize) char buffer2[Network::kBufferSize];
+#endif
 #if defined(USE_AVX512) && defined(NNUE_HAS_SFNN_ACCUMULATOR_PROPAGATE)
         networks().feature_transformer.EnsureAccumulator(pos, refresh);
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // wsb: 選択bucketと共有bucket、2つのネットワークの出力 (FV_SCALE適用前の
+        // raw値) の平均を評価値にする。`PropagatePairFromAccumulator`が両方を
+        // まとめて計算する (fc_1/fc_2は1つのSIMDループで両bucket分を計算する —
+        // `Network::PropagatePairFromAccumulator`のコメント参照)。
+        const auto scores = networks().network[bucket].PropagatePairFromAccumulator(
+            accumulator.accumulation, pos.side_to_move(),
+            networks().network[kSharedBucketIndex], buffer, buffer2);
+        const std::int32_t raw_output = scores.a + scores.b;
+        const int kScoreDivisor = FV_SCALE * 2;
+#else
         const auto output = networks().network[bucket].PropagateFromAccumulator(
             accumulator.accumulation, pos.side_to_move(), buffer);
+        const std::int32_t raw_output = output[0];
+        const int kScoreDivisor = FV_SCALE;
+#endif
 #else
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
         networks().feature_transformer.Transform(pos, transformed_features, refresh);
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // wsb: 選択bucketと共有bucket、2つのネットワークの出力 (FV_SCALE適用前の
+        // raw値) の平均を評価値にする。`PropagatePair`が両方をまとめて計算する
+        // (fc_0/fc_1/fc_2すべてを1つのSIMDループで両bucket分計算する —
+        // `Network::PropagatePair`のコメント参照。`Propagate`を2回呼ぶ場合と
+        // 数値結果は完全に一致する)。
+        const auto scores = networks().network[bucket].PropagatePair(
+            transformed_features, networks().network[kSharedBucketIndex], buffer, buffer2);
+        const std::int32_t raw_output = scores.a + scores.b;
+        const int kScoreDivisor = FV_SCALE * 2;
+#else
         const auto output = networks().network[bucket].Propagate(transformed_features, buffer);
+        const std::int32_t raw_output = output[0];
+        const int kScoreDivisor = FV_SCALE;
+#endif
 #endif
 #else
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
         networks().feature_transformer.Transform(pos, transformed_features, refresh);
         const auto output = networks().network[0].Propagate(transformed_features, buffer);
+        const std::int32_t raw_output = output[0];
+        const int kScoreDivisor = FV_SCALE;
 #endif
 
         // VALUE_MAX_EVALより大きな値が返ってくるとaspiration searchがfail highして
@@ -894,7 +941,7 @@ namespace {
         // しかし、教師生成時などdepth固定で探索するときに探索から戻ってこなくなるので
         // そのスレッドの計算時間を無駄にする。またdepth固定対局でtime-outするようになる。
 
-        auto score = static_cast<Value>(output[0] / FV_SCALE);
+        auto score = static_cast<Value>(raw_output / kScoreDivisor);
 
         // 1) ここ、下手にclipすると学習時には影響があるような気もするが…。
         // 2) accumulator.scoreは、差分計算の時に用いないので書き換えて問題ない。

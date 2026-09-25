@@ -88,6 +88,15 @@
 #ifndef NNUE_SFNN_ROUTER_N
 #define NNUE_SFNN_ROUTER_N 0
 #endif
+
+// wsb (WithSharedBucket、`--bucket-mode`/アーキ名の末尾トークン `wsb`)。1のとき、
+// hand/king/progress/routerの合成バケットに加えて「常に選ばれる共有バケット」を
+// 1個追加する (`LayerStacks` にこの+1が既に反映済み、共有バケットのindexは常に
+// `kLayerStacks - 1`)。評価値は選択された1バケットと共有バケットの出力平均になる
+// (`evaluate_nnue.cpp` の `ComputeScore` 参照)。
+#ifndef NNUE_SFNN_USE_SHARED_BUCKET
+#define NNUE_SFNN_USE_SHARED_BUCKET 0
+#endif
 #endif
 
 namespace YaneuraOu {
@@ -200,9 +209,19 @@ namespace RouterKPAbs {
 #else
 	constexpr std::uint32_t kRouterHashPart = 0u;
 #endif
+#if NNUE_SFNN_USE_SHARED_BUCKET
+	// wsb 有無で取り違えないよう hash に混ぜる (重み配列サイズ以外に構造上の差分が
+	// 無いため、bucket数の一致だけでは wsb 有無を区別できない)。
+	constexpr std::uint32_t kSharedBucketHashPart = 0x77534200u;
+#else
+	constexpr std::uint32_t kSharedBucketHashPart = 0u;
+#endif
 	constexpr std::uint32_t kHashValue =
-	    kSfnnBaseHashValue ^ kProgressHashPart ^ kRouterHashPart;
+	    kSfnnBaseHashValue ^ kProgressHashPart ^ kRouterHashPart ^ kSharedBucketHashPart;
 	constexpr int kLayerStacks = LayerStacks;
+	// wsb有効時、共有バケット (常に評価される側) のindex。選択バケットの範囲は
+	// 0..kSharedBucketIndex-1 (`stack_index_for_nnue` 参照)。wsb無効時は未使用。
+	constexpr int kSharedBucketIndex = kLayerStacks - 1;
 #else
 	constexpr std::uint32_t kHashValue =
 	    FeatureTransformer::GetHashValue() ^ Network::GetHashValue();

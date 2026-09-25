@@ -18,9 +18,31 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 
 namespace YaneuraOu {
 namespace Eval::NNUE {
+
+// WSB (WithSharedBucket) 用: `Fc0Layer` (fc_0) が融合forward
+// (`PropagatePair(input, other, outA, outB)`、同じ入力を2つのbucketの重みに
+// 対してまとめて計算する) をサポートしているかどうかの検出。
+// `AffineTransformSparseInputExplicit` は対応しているが、`sfnn_common_shard`
+// 系アーキテクチャが使う `AffineTransformCommonShardInputExplicit` は
+// (accumulator直読みという別種の複雑な経路のため) 今のところ対応していない
+// — 未対応の場合は `SfnnNetwork::PropagatePair` が個別に `Propagate` を2回
+// 呼ぶフォールバックへ自動的に切り替わる (常に正しく動く。融合による高速化
+// だけが効かない)。
+template <typename Fc0Layer, typename = void>
+struct HasFusedFc0Pair : std::false_type {};
+
+template <typename Fc0Layer>
+struct HasFusedFc0Pair<Fc0Layer,
+                        std::void_t<decltype(std::declval<const Fc0Layer&>().PropagatePair(
+                            std::declval<const typename Fc0Layer::InputType*>(),
+                            std::declval<const Fc0Layer&>(),
+                            std::declval<typename Fc0Layer::OutputType*>(),
+                            std::declval<typename Fc0Layer::OutputType*>()))>> : std::true_type {};
 
 template <typename Fc0Layer, IndexType Hidden1Dims, IndexType Hidden2Dims, bool PackedTail>
 struct SfnnNetworkBuffer;
@@ -168,10 +190,78 @@ struct SfnnNetwork {
 		return buf.fc_2_out;
 	}
 
+	// WSB (WithSharedBucket) 用の出力ペア (`*this` = 選択bucket、`other` = 共有
+	// bucket。呼び出し順は問わない、対称な演算)。
+	struct PairOutput {
+		OutputType a;
+		OutputType b;
+	};
+
+	// [`PropagateTail`] のWSB用ペア版。`bufA`/`bufB` はそれぞれ `*this`/`other`
+	// の fc_0 出力を含んだ状態で渡す (`fc_0.PropagatePair`/`PropagatePairFromAccumulator`
+	// が事前に書き込む)。fc_1 以降は [`Layers::AffineTransformExplicit::PropagatePair`]
+	// でまとめて1ループで計算する — ただし `kUsePackedTail` (H2==64のAVX512 packed
+	// path) はすでに1回で完結する高度に最適化された経路なので、ここでは融合せず
+	// 個別に呼ぶ (fc_0の融合だけで最大の行列積 (Hidden1入力) の重複計算/nnz列挙の
+	// 重複を無くせるため、packed tail 自体を融合しなくても実質的な狙いは満たす)。
+	template <typename BufferType>
+	PairOutput PropagateTailPair(BufferType& bufA, const SfnnNetwork& other, BufferType& bufB) const {
+		if constexpr (kUsePackedTail) {
+			const OutputType* outA = PropagateTail(bufA);
+			const OutputType* outB = other.PropagateTail(bufB);
+			return {outA[0], outB[0]};
+		} else {
+			MakeHidden1Input(bufA.fc_0_out, bufA.ac_sqr_0_out);
+			other.MakeHidden1Input(bufB.fc_0_out, bufB.ac_sqr_0_out);
+			fc_1.PropagatePair(bufA.ac_sqr_0_out, bufB.ac_sqr_0_out, other.fc_1, bufA.fc_1_out, bufB.fc_1_out);
+			ac_1.Propagate(bufA.fc_1_out, bufA.ac_1_out);
+			other.ac_1.Propagate(bufB.fc_1_out, bufB.ac_1_out);
+			fc_2.PropagatePair(bufA.ac_1_out, bufB.ac_1_out, other.fc_2, bufA.fc_2_out, bufB.fc_2_out);
+
+			OutputType outA = bufA.fc_2_out[0];
+			OutputType outB = bufB.fc_2_out[0];
+			if constexpr (kUseShortcut) {
+				outA += bufA.fc_0_out[kHidden1Dims];
+				outB += bufB.fc_0_out[kHidden1Dims];
+			}
+			return {outA, outB};
+		}
+	}
+
 	const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, char* buffer) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 		fc_0.Propagate(transformedFeatures, buf.fc_0_out);
 		return PropagateTail(buf);
+	}
+
+	// WSB (WithSharedBucket) 用: `*this` (選択bucket) と `other` (共有bucket) の
+	// forwardをまとめて1回で計算する。fc_0 (FT出力 -> Hidden1) は両bucketで
+	// **入力 (`transformedFeatures`) が同じ**なので、1回のSIMDループで両方の
+	// 重み行列に対する積和を行う ([`Layers::AffineTransformSparseInputExplicit::
+	// PropagatePair`] — 疎入力のnnz列挙も1回で済む)。fc_1以降は
+	// [`PropagateTailPair`] に委譲する。`bufferA`/`bufferB` は呼び出し側が別々に
+	// 確保すること (`*this`用と`other`用、`PropagateTail`のように使い回すこと
+	// はできない — 両方の中間活性を同時に保持する必要があるため)。
+	//
+	// 数値結果は `Propagate(transformedFeatures, bufferA)[0]` /
+	// `other.Propagate(transformedFeatures, bufferB)[0]` を別々に呼んだ場合と
+	// 完全に一致する。
+	PairOutput PropagatePair(const TransformedFeatureType* transformedFeatures,
+	                          const SfnnNetwork& other,
+	                          char* bufferA,
+	                          char* bufferB) const {
+		auto& bufA = *reinterpret_cast<Buffer*>(bufferA);
+		auto& bufB = *reinterpret_cast<Buffer*>(bufferB);
+		if constexpr (HasFusedFc0Pair<Fc0Layer>::value) {
+			fc_0.PropagatePair(transformedFeatures, other.fc_0, bufA.fc_0_out, bufB.fc_0_out);
+		} else {
+			// この `Fc0Layer` (例: `sfnn_common_shard` 系アーキテクチャの
+			// `AffineTransformCommonShardInputExplicit`) は融合forwardに対応
+			// していないので、個別に呼ぶ (正しさは保つ)。
+			fc_0.Propagate(transformedFeatures, bufA.fc_0_out);
+			other.fc_0.Propagate(transformedFeatures, bufB.fc_0_out);
+		}
+		return PropagateTailPair(bufA, other, bufB);
 	}
 
 #if defined(USE_AVX512)
@@ -182,6 +272,23 @@ struct SfnnNetwork {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 		fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, buf.fc_0_out);
 		return PropagateTail(buf);
+	}
+
+	// [`PropagatePair`] のAVX512 accumulator直読み版。fc_0 の
+	// `PropagateSfnnFromAccumulator` 自体は (accumulatorのperspective走査/chunk
+	// 処理という別種の複雑さを持つ特殊経路のため) 融合せず個別に呼ぶ — fc_1以降
+	// ([`PropagateTailPair`]) はこのTransform経由版と共通の融合を使う。
+	template <typename AccumulationType>
+	PairOutput PropagatePairFromAccumulator(const AccumulationType& accumulation,
+	                                        Color sideToMove,
+	                                        const SfnnNetwork& other,
+	                                        char* bufferA,
+	                                        char* bufferB) const {
+		auto& bufA = *reinterpret_cast<Buffer*>(bufferA);
+		auto& bufB = *reinterpret_cast<Buffer*>(bufferB);
+		fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, bufA.fc_0_out);
+		other.fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, bufB.fc_0_out);
+		return PropagateTailPair(bufA, other, bufB);
 	}
 #endif
 };
