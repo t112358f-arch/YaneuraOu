@@ -268,20 +268,34 @@ struct SfnnNetwork {
 	}
 
 #if defined(USE_AVX512)
+	// fc_0 の種類/出力次元に応じて、accumulator直読み版の実装を選ぶ。
+	//  - AffineTransformSparseInputExplicit<kInputDims,16> (H1=16 / H1=15+shortcut)
+	//      : PropagateSfnn16FromAccumulator (SFNNwoPSQT時のみ存在)
+	//  - それ以外 (出力8次元のSparse版、CommonShard版など)
+	//      : PropagateSfnnFromAccumulator
+	template <typename AccumulationType>
+	static void PropagateFc0FromAccumulator(const Fc0Layer& fc,
+	                                        const AccumulationType& accumulation,
+	                                        Color sideToMove,
+	                                        typename Fc0Layer::OutputType* output) {
+		if constexpr (std::is_same_v<Fc0Layer, Layers::AffineTransformSparseInputExplicit<kInputDims, 16>>) {
+#if defined(SFNNwoPSQT)
+			fc.template PropagateSfnn16FromAccumulator<kInputDims>(accumulation, sideToMove, output);
+#else
+			static_assert(!std::is_same_v<Fc0Layer, Fc0Layer>,
+			              "16-output fused fc_0 path requires SFNNwoPSQT.");
+#endif
+		} else {
+			fc.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, output);
+		}
+	}
+
 	template <typename AccumulationType>
 	const OutputType* PropagateFromAccumulator(const AccumulationType& accumulation,
 	                                           Color sideToMove,
 	                                           char* buffer) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
-#if defined(NNUE_SFNN_FUSED_FT)
-		if constexpr (kHidden1OutputDims == 16
-		              && std::is_same_v<Fc0Layer, Layers::AffineTransformSparseInputExplicit<kInputDims, 16>>)
-			fc_0.template PropagateSfnn16FromAccumulator<kInputDims>(accumulation, sideToMove, buf.fc_0_out);
-		else
-			fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, buf.fc_0_out);
-#else
-		fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, buf.fc_0_out);
-#endif
+		PropagateFc0FromAccumulator(fc_0, accumulation, sideToMove, buf.fc_0_out);
 		return PropagateTail(buf);
 	}
 
@@ -297,8 +311,8 @@ struct SfnnNetwork {
 	                                        char* bufferB) const {
 		auto& bufA = *reinterpret_cast<Buffer*>(bufferA);
 		auto& bufB = *reinterpret_cast<Buffer*>(bufferB);
-		fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, bufA.fc_0_out);
-		other.fc_0.template PropagateSfnnFromAccumulator<kInputDims>(accumulation, sideToMove, bufB.fc_0_out);
+		PropagateFc0FromAccumulator(fc_0, accumulation, sideToMove, bufA.fc_0_out);
+		PropagateFc0FromAccumulator(other.fc_0, accumulation, sideToMove, bufB.fc_0_out);
 		return PropagateTailPair(bufA, other, bufB);
 	}
 #endif
