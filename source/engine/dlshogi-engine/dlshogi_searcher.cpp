@@ -105,7 +105,10 @@ void DlshogiSearcher::InitGPU(const std::string& model_path, const std::string& 
 
 	// モデルの読み込み
     ElapsedTimer time;
-        
+#if defined(ENABLE_NN_CACHE)
+	SetDnnCacheSize(search_options.dnn_cache_size);
+#endif
+	        
 	for (size_t i = 0; i < search_groups_size ; i++)
 		if (thread_settings[i] > 0)
 			search_groups[i].Initialize(model_path, model_architecture,

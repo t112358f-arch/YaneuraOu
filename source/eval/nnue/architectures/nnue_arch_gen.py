@@ -5,6 +5,7 @@
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -103,6 +104,9 @@ if len(arches) <= 3 :
 #     SFNN_halfka2_1024_7_64_hand16_k3k3 / hand64z_k9k9 / hand64z_k13k13z / hand64z_k21k21 / hand64z_k29k29 のように、
 #     hand bucketと複合できる。
 #     SFNN_halfka2_1024_7_64_k3k3_progress8 のようにprogress2/3/4/8/16/32とも複合できる。
+#     SFNN_halfka2_1024_7_64_k3k3_wsb のように、バケット名の最後にwsb (WithSharedBucket)
+#     を置くと、常に選ばれる共有バケットを1個追加してバケット数をN+1にし、選択された
+#     1バケットと共有バケットの出力平均を評価値にする。
 SFNN = False
 layer_stack_name = ""
 layer_stack_count = ""
@@ -111,14 +115,86 @@ layer_stack_hand_bucket_type = "0"
 layer_stack_king_buckets = "1"
 layer_stack_king_bucket_type = "0"
 layer_stack_progress_buckets = "1"
+layer_stack_router_name = "NONE"
+layer_stack_router_mode = "0"
+layer_stack_router_n = "0"
+layer_stack_shared_bucket = "0"
+layer_stack_shared_bucket_inner = "1"
+layer_stack_selectable_buckets = "1"
+layer_stack_order_hand = "0"
+layer_stack_order_king = "1"
+layer_stack_order_progress = "2"
+layer_stack_order_router = "3"
 sfnn_group_count = "1"
 sfnn_common_dims = "0"
 sfnn_shard_dims = "0"
 sfnn_common_shard = False
 
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_routerkpabs9 のように、末尾 (合成順に関わらず常に最後に
+    #    掛かる = 最下位桁) に routerkpabs<N> を置くと、tatara `--bucket-mode ...routerkpabs<N>`
+    #    で学習した net 用のビルドになる。ネットワーク構造自体は無印 (ls<N>相当) と同一で、
+    #    バケット「選択方式」だけが (hand/king/progressの合成値ではなく) 学習済みの
+    #    RouterKPAbs (KP-absolute特徴の重み和のargmax、tatara側 `router_kpabs.rs` 参照) になる。
+    #    hand/king/progressバケットと複合可能で、その場合は
+    #    「(hand/king/progressの合成バケット) * N + (routerkpabsの選択結果)」の順で合成する
+    #    (routerは常に最後 = 最下位桁)。
+    #
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_routerft8ft8 のように末尾に routerft<R>ft<R> (Rは正の整数、
+    #    末尾は"ft<R>"が2回連続) を置くと、tatara `--bucket-mode ...routerft<R>ft<R>` で学習した
+    #    net 用のビルドになる。この場合は routerkpabs と異なり **ネットワーク構造自体が変わる** —
+    #    FeatureTransformerの片視点あたりの (pairwise-multiply前の) accumulator幅が
+    #    `kInputDims + R` に広がる (router の生スコアR個がFTの同じaccumulator/重み行列に同居し、
+    #    評価関数本体のFTと一緒に差分計算される; 詳細は `nnue_feature_transformer.h` の
+    #    `TANUKI_ROUTER_ARCH_FTBYFT` 分岐を参照)。バケット数は R*R (STM側R通り×NSTM側R通りの
+    #    argmaxの組み合わせ)。hand/king/progressバケットと複合可能で、routerkpabsと同様に
+    #    常に最後 (最下位桁) に合成する。
+    #
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_orderPRK のように order<letters> (H/K/P/R の並び、
+    #    実際に使われているカテゴリちょうど全部の順列) を置くと、バケットindexの
+    #    合成順序 (桁の重み) を明示的に変更できる。省略時のデフォルトは
+    #    hand→king→progress→router (常に router が最下位桁になる、従来通りの順序)。
+    #    order<letters> はバケット名の中に最大1個。
+    #
+    # 📝 SFNN_halfka2_1024_7_64_k3k3_progress8_wsb のように、バケット名のどこかに
+    #    wsb (WithSharedBucket) を置く (最大1個、位置は自由) と、「wsb の直前の
+    #    トークンに対応するカテゴリ以降 (合成順序上、そのカテゴリより下位の桁を
+    #    全部含むブロック)」に、そのブロックの選択肢数 (=ブロックに属するカテゴリの
+    #    バケット数の積) に加えてもう1個、「常に選ばれる共有バケット」を追加する。
+    #    wsb より外側 (合成順序上、より上位の桁) のカテゴリはそのまま外側の乗数として
+    #    残る。例 (progress8 と routerkpabs16、デフォルト合成順序 progress→router):
+    #      - progress8_wsb_routerkpabs16: wsb の直前は progress (合成順序の最上位桁) →
+    #        ブロック = progress×router 全部。常に有効な共有バケット1個 + 選択
+    #        バケット8*16個、合計 1+8*16=129 バケット (グローバルに1個だけの共有バケット、
+    #        旧仕様と同じ挙動)。
+    #      - progress8_routerkpabs16_wsb: wsb の直前は router → ブロック = router だけ。
+    #        progress の値ごとに共有バケット1個+選択16個、合計 8*(1+16)=136 バケット。
+    #    wsb がバケット名の先頭トークン (直前トークンなし) の場合も、上と同じく
+    #    グローバルに1個だけの共有バケットになる。共有バケットの重みは局面に関わらず
+    #    常にforwardされ、選択された1バケットとの出力平均が評価値になる
+    #    (`evaluate_nnue.cpp` の `ComputeScore` 参照)。バケット「選択方式」自体
+    #    (hand/king/progress/router) は無印と変わらない。
+    #
+    #    ⚠️ 破壊的変更: 旧仕様 (wsb は常にバケット名の末尾のみ許可、常に
+    #    「グローバルに1個だけの共有バケット」) から意味が変わっている。旧仕様の
+    #    挙動を再現したい場合は wsb をバケット名の先頭に置く (`wsb_...`) こと。
+    #
+# 📝 routerkpabs と routerft<R>ft<R> は互いに排他 (同時指定不可)。router系は合計で最大1個。
+# 📝 wsb は他の全トークンと複合可能 (排他なし)。最大1個、バケット名中の位置は自由
+#    (ただし order<letters> トークンの直後には置けない)。
+# カテゴリの識別子 (合成順序 order<letters> や wsb の付け根の解決に使う)。
+CAT_HAND, CAT_KING, CAT_PROGRESS, CAT_ROUTER = "H", "K", "P", "R"
+DEFAULT_ORDER = [CAT_HAND, CAT_KING, CAT_PROGRESS, CAT_ROUTER]
+
 def parse_sfnn_layer_stack_spec(layer_stack_spec):
     if layer_stack_spec == "":
-        return "NONE", "1", "1", "0", "1", "0", "1"
+        # hand/king/progress/router いずれも無し (selectable_buckets=1, wsbも無し)。
+        # router_mode は「router無し」を表す NNUE_SFNN_ROUTER_MODE_NONE (0) にする
+        # (旧コードは router_name="NONE" なのに router_mode="1" (KPABS) を返しており、
+        #  ROUTER_N=0 と組み合わさって evaluate_nnue.cpp の static_assert
+        #  `NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE || NNUE_SFNN_ROUTER_N >= 1`
+        #  に矛盾する latent bug だったので、ここで合わせて修正する)。
+        return ("NONE", "1", "1", "0", "1", "0", "1", "NONE", "0", "0", "0",
+            "1", "1", "0", "1", "2", "3")
 
     normalized = layer_stack_spec
     for long_name, short_name in {
@@ -141,6 +217,15 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
     king_name = ""
     king_type = 0
     progress_name = ""
+    router_name = ""
+    router_buckets = 1
+    # 0 = NNUE_SFNN_ROUTER_MODE_NONE, 1 = KPABS, 2 = FTFT
+    router_mode = 0
+    shared_bucket = 0
+    # wsb の直前トークンが属していたカテゴリ (H/K/P/R)。文字列先頭が wsb だった
+    # 場合、または wsb が無い場合は None。
+    shared_bucket_after = None
+    explicit_order = None  # order<letters> トークンで指定された、実際に見た並び (部分文字列)
 
     hand_map = {
         "HAND4": (4, 1),
@@ -159,9 +244,56 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
         "K13K13Z": (13 * 13, 6),
     }
     progress_values = {2, 3, 4, 8, 16, 32}
+    router_kpabs_re = re.compile(r"^ROUTERKPABS(\d+)$")
+    router_ftft_re = re.compile(r"^ROUTERFT(\d+)FT(\d+)$")
+    order_re = re.compile(r"^ORDER([HKPR]{1,4})$")
 
-    for token in [t for t in normalized.split("_") if t]:
+    def token_category(token):
+        # トークン文字列 (正規化済み、大文字) がどのカテゴリに属するかを判定する
+        # (wsb の直前トークンをカテゴリへ解決するのに使う)。
         if token in hand_map:
+            return CAT_HAND
+        if token in king_map:
+            return CAT_KING
+        if token.startswith("PROGRESS") and token[len("PROGRESS"):].isdigit():
+            return CAT_PROGRESS
+        if router_kpabs_re.match(token) or router_ftft_re.match(token):
+            return CAT_ROUTER
+        return None
+
+    tokens = [t for t in normalized.split("_") if t]
+    wsb_seen = False
+    for pos, token in enumerate(tokens):
+        m_kpabs = router_kpabs_re.match(token)
+        m_ftft = router_ftft_re.match(token)
+        m_order = order_re.match(token)
+        if token == "WSB":
+            if wsb_seen:
+                print(f"Error! : wsb (WithSharedBucket) may appear at most once in {layer_stack_spec}.")
+                raise SystemExit(1)
+            wsb_seen = True
+            shared_bucket = 1
+            if pos == 0:
+                shared_bucket_after = None
+            else:
+                prev = tokens[pos - 1]
+                if order_re.match(prev):
+                    print(f"Error! : wsb (WithSharedBucket) cannot immediately follow an order<letters> token in {layer_stack_spec}.")
+                    raise SystemExit(1)
+                shared_bucket_after = token_category(prev)
+                if shared_bucket_after is None:
+                    print(f"Error! : wsb (WithSharedBucket) must immediately follow a hand/king/progress/router token in {layer_stack_spec}.")
+                    raise SystemExit(1)
+        elif m_order:
+            if explicit_order is not None:
+                print(f"Error! : order<letters> may appear at most once in {layer_stack_spec}.")
+                raise SystemExit(1)
+            letters = m_order.group(1)
+            if len(set(letters)) != len(letters):
+                print(f"Error! : order<letters> must not repeat a letter, got {token}.")
+                raise SystemExit(1)
+            explicit_order = list(letters)
+        elif token in hand_map:
             if hand_buckets != 1:
                 print(f"Error! : duplicate SFNN hand bucket in {layer_stack_spec}.")
                 raise SystemExit(1)
@@ -183,17 +315,119 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec):
                 raise SystemExit(1)
             progress_name = token
             progress_buckets = int(raw)
+        elif m_kpabs:
+            if router_mode != 0:
+                print(f"Error! : router bucket (routerkpabs/routerft<R>ft<R>) may appear at most once in {layer_stack_spec}.")
+                raise SystemExit(1)
+            n = int(m_kpabs.group(1))
+            if n < 1:
+                print(f"Error! : routerkpabs<N> requires N >= 1 , got {token}.")
+                raise SystemExit(1)
+            router_name = token
+            router_mode = 1
+            router_buckets = n
+        elif m_ftft:
+            if router_mode != 0:
+                print(f"Error! : router bucket (routerkpabs/routerft<R>ft<R>) may appear at most once in {layer_stack_spec}.")
+                raise SystemExit(1)
+            r_a, r_b = int(m_ftft.group(1)), int(m_ftft.group(2))
+            if r_a != r_b:
+                print(f"Error! : routerft<R>ft<R> requires both R to match (got {token}).")
+                raise SystemExit(1)
+            if r_a < 1:
+                print(f"Error! : routerft<R>ft<R> requires R >= 1 , got {token}.")
+                raise SystemExit(1)
+            router_name = token
+            router_mode = 2
+            router_buckets = r_a * r_a
         else:
             print(f"Error! : unknown SFNN layer stack token {token} in {layer_stack_spec}.")
-            print("Error! : SFNN layer stack tokens are hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, and progress2/3/4/8/16/32.")
+            print("Error! : SFNN layer stack tokens are hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, routerft<R>ft<R>, order<letters>, and wsb.")
             raise SystemExit(1)
 
-    canonical = "_".join([name for name in [hand_name, king_name, progress_name] if name])
-    if canonical == "":
-        canonical = "NONE"
+    present = [c for c, present_flag in [
+        (CAT_HAND, hand_buckets != 1 or hand_name != ""),
+        (CAT_KING, king_buckets != 1 or king_name != ""),
+        (CAT_PROGRESS, progress_buckets != 1 or progress_name != ""),
+        (CAT_ROUTER, router_mode != 0),
+    ] if present_flag]
 
-    layer_count = hand_buckets * king_buckets * progress_buckets
-    return canonical, str(layer_count), str(hand_buckets), str(hand_type), str(king_buckets), str(king_type), str(progress_buckets)
+    # order<letters> トークンの検証: 実際に使われているカテゴリちょうど全部の順列で
+    # あること (順列である事は上の重複禁止チェックで保証済みなので、ここでは集合として
+    # 一致するかだけ見ればよい)。
+    if explicit_order is not None:
+        if sorted(explicit_order) != sorted(present):
+            print(f"Error! : order<letters> must be a permutation of exactly the categories present in {layer_stack_spec} (letters={''.join(explicit_order)}, present={''.join(present)}).")
+            raise SystemExit(1)
+        order = explicit_order + [c for c in DEFAULT_ORDER if c not in explicit_order]
+    else:
+        order = list(DEFAULT_ORDER)
+
+    canonical_parts = []
+    if explicit_order is not None and len(present) > 1:
+        canonical_parts.append("ORDER" + "".join(c for c in order if c in present))
+    for name in [hand_name, king_name, progress_name, router_name]:
+        if name:
+            canonical_parts.append(name)
+    canonical = "_".join(canonical_parts) if canonical_parts else "NONE"
+    if shared_bucket:
+        if shared_bucket_after is None:
+            canonical = "WSB_" + canonical if canonical != "NONE" else "WSB"
+        else:
+            # wsb は元々置かれていた直前カテゴリの直後に挿入する。
+            name_of = {CAT_HAND: hand_name, CAT_KING: king_name,
+                       CAT_PROGRESS: progress_name, CAT_ROUTER: router_name}
+            anchor = name_of[shared_bucket_after]
+            parts = canonical.split("_")
+            insert_at = parts.index(anchor) + 1 if anchor in parts else len(parts)
+            parts.insert(insert_at, "WSB")
+            canonical = "_".join(parts)
+
+    # 合成順序 (order、最上位桁から順) に従って各カテゴリのバケット数を並べ、
+    # wsb の直前カテゴリ (shared_bucket_after) の合成順序上の位置から末尾までを
+    # 「inner ブロック」、それより手前を「outer」とする。
+    bucket_count_of = {CAT_HAND: hand_buckets, CAT_KING: king_buckets,
+                        CAT_PROGRESS: progress_buckets, CAT_ROUTER: router_buckets}
+    present_in_order = [c for c in order if c in present]
+    if shared_bucket:
+        cut = present_in_order.index(shared_bucket_after) if shared_bucket_after is not None else 0
+    else:
+        cut = 0
+    outer_cats = present_in_order[:cut] if shared_bucket else []
+    inner_cats = present_in_order[cut:] if shared_bucket else present_in_order
+    outer_buckets = 1
+    for c in outer_cats:
+        outer_buckets *= bucket_count_of[c]
+    inner_buckets = 1
+    for c in inner_cats:
+        inner_buckets *= bucket_count_of[c]
+    selectable_buckets = hand_buckets * king_buckets * progress_buckets * router_buckets
+    assert selectable_buckets == outer_buckets * inner_buckets
+
+    # layer_count (=kLayerStacks): wsb無効時は selectable_buckets そのもの、有効時は
+    # 各outerブロックに共有バケット1個ずつを挿入した outer*(inner+1)。
+    if shared_bucket:
+        layer_count = outer_buckets * (inner_buckets + 1)
+    else:
+        layer_count = selectable_buckets
+
+    router_r = 0
+    if router_mode == 2:
+        # routerft<R>ft<R> の R (kRouterFtByFtR)。routerkpabs / router無しでは 0。
+        router_r = int(router_ftft_re.match(router_name).group(1))
+    router_n = router_buckets if router_mode == 1 else router_r
+
+    # NNUE_SFNN_ORDER_HAND/KING/PROGRESS/ROUTER: 各カテゴリの合成順序上のランク
+    # (0=最上位桁 .. 3=最下位桁)。C++側で digits[] 配列を組み立てるのに使う。
+    order_rank = {c: i for i, c in enumerate(order)}
+
+    return (canonical, str(layer_count), str(hand_buckets), str(hand_type),
+        str(king_buckets), str(king_type), str(progress_buckets),
+        router_name if router_name else "NONE", str(router_mode), str(router_n),
+        str(shared_bucket), str(inner_buckets if shared_bucket else selectable_buckets),
+        str(selectable_buckets),
+        str(order_rank[CAT_HAND]), str(order_rank[CAT_KING]),
+        str(order_rank[CAT_PROGRESS]), str(order_rank[CAT_ROUTER]))
 
 def sfnn_uses_shortcut(hidden1_dims: int) -> bool:
     if hidden1_dims % 8 == 7:
@@ -237,7 +471,15 @@ if arches[0].startswith("SFNN"):
     (layer_stack_name, layer_stack_count, layer_stack_hand_buckets,
         layer_stack_hand_bucket_type,
         layer_stack_king_buckets, layer_stack_king_bucket_type,
-        layer_stack_progress_buckets) = parse_sfnn_layer_stack_spec(layer_stack_spec)
+        layer_stack_progress_buckets,
+        layer_stack_router_name, layer_stack_router_mode,
+        layer_stack_router_n,
+        layer_stack_shared_bucket,
+        layer_stack_shared_bucket_inner,
+        layer_stack_selectable_buckets,
+        layer_stack_order_hand, layer_stack_order_king,
+        layer_stack_order_progress,
+        layer_stack_order_router) = parse_sfnn_layer_stack_spec(layer_stack_spec)
 
     arches = [arches[1], arches[2], arches[3], arches[4], layer_stack_count]
 
@@ -465,10 +707,38 @@ if SFNN:
     if int(layers[0]) < 128:
         small_sfnn_ft_macro = "#define NNUE_SMALL_SFNN_FT"
 
+    # routerft<R>ft<R> のときだけ、FeatureTransformer側 (kTransformedFeatureDimensions =
+    # per-perspective, pre-pairwise-multiply の accumulator幅) が fc_0 の入力幅 (kInputDims)
+    # より kRouterFtByFtR (=R) だけ広くなる — router の生スコア R個 (perspectiveごと) が
+    # 同じ accumulator/重み行列に同居するため (詳細は nnue_feature_transformer.h の
+    # TANUKI_ROUTER_ARCH_FTBYFT 分岐を参照)。routerkpabs / router無しでは従来通り一致する。
+    router_is_ftft = layer_stack_router_mode == "2"
+    router_ft_r = int(layer_stack_router_n) if router_is_ftft else 0
+    main_dims = int(layers[0])
+    transformed_dims_value = main_dims + router_ft_r
+
+    router_macro_block = f"""
+        #define NNUE_SFNN_ROUTER_MODE_NONE 0
+        #define NNUE_SFNN_ROUTER_MODE_KPABS 1
+        #define NNUE_SFNN_ROUTER_MODE_FTFT 2
+        #define NNUE_SFNN_ROUTER_MODE {layer_stack_router_mode}
+        // routerkpabsではバケット数そのもの、routerft<R>ft<R>ではRを表す (バケット数はR*R)。
+        // 無印/router無しでは 0。
+        #define NNUE_SFNN_ROUTER_N {layer_stack_router_n}
+    """
+    if router_is_ftft:
+        router_macro_block += f"""
+        // `--bucket-mode ...routerft{{R}}ft{{R}}` (tatara) 用の net。FeatureTransformer の
+        // accumulator に同居する router の生スコア数 (perspectiveごとに R 個)。
+        // routerkpabs / router無しビルドでは定義しない (0扱い)。
+        #define TANUKI_ROUTER_ARCH_FTBYFT
+        constexpr IndexType kRouterFtByFtR = {router_ft_r};
+    """
+
     header += f"""
         // Number of input feature dimensions after conversion
         // 変換後の入力特徴量の次元数
-        constexpr IndexType kTransformedFeatureDimensions = {layers[0]};
+        constexpr IndexType kTransformedFeatureDimensions = {transformed_dims_value};
 
         // 小幅SFNN専用。従来幅のSFNNでは定義せず、既存の高速経路をそのまま使う。
         {small_sfnn_ft_macro}
@@ -481,6 +751,32 @@ if SFNN:
         #define NNUE_SFNN_KING_BUCKETS {layer_stack_king_buckets}
         #define NNUE_SFNN_KING_BUCKET_TYPE {layer_stack_king_bucket_type}
         #define NNUE_SFNN_PROGRESS_BUCKETS {layer_stack_progress_buckets}
+        {router_macro_block}
+
+        // バケットindexの合成順序 (桁の重み、0=最上位桁 .. 3=最下位桁)。
+        // `order<letters>` トークン省略時はデフォルト順序 hand(0)→king(1)→
+        // progress(2)→router(3) (常に router が最下位桁になる、従来通りの順序)。
+        #define NNUE_SFNN_ORDER_HAND {layer_stack_order_hand}
+        #define NNUE_SFNN_ORDER_KING {layer_stack_order_king}
+        #define NNUE_SFNN_ORDER_PROGRESS {layer_stack_order_progress}
+        #define NNUE_SFNN_ORDER_ROUTER {layer_stack_order_router}
+
+        // hand/king/progress/router の合成バケット数 (wsbの共有バケットを含まない)。
+        #define NNUE_SFNN_SELECTABLE_BUCKETS {layer_stack_selectable_buckets}
+
+        // wsb (WithSharedBucket)。1のとき、「wsb の直前のカテゴリ以降 (合成順序上、
+        // より下位の桁を全部含むブロック)」ごとに共有バケットが1個ずつ挿入され、
+        // LayerStacks (={layers[3]}) = (そのブロックより外側のバケット数の積) ×
+        // (ブロックの選択バケット数 (=NNUE_SFNN_SHARED_BUCKET_INNER) + 1) になる。
+        // 各共有バケットは、同じブロックに属する選択バケットのどれが選ばれても
+        // 常に評価され、選択された1バケットとの出力平均が評価値になる
+        // (`evaluate_nnue.cpp` の `ComputeScore` / `stack_index_for_nnue` 参照)。
+        // 0なら従来通り選択された1バケットのみを使う。
+        #define NNUE_SFNN_USE_SHARED_BUCKET {layer_stack_shared_bucket}
+        // wsb有効時の「ブロック」のバケット数 (共有バケット自体の+1を含まない)。
+        // wsb無効時は未使用 (NNUE_SFNN_SELECTABLE_BUCKETS と同じ値を入れてあるが
+        // 参照されない)。
+        #define NNUE_SFNN_SHARED_BUCKET_INNER {layer_stack_shared_bucket_inner}
 
         // Number of groups for the first affine layer of SFNN.
         // common+shard fc_0でのみ2以上になる。
@@ -492,7 +788,9 @@ if SFNN:
         constexpr IndexType kHidden1ShardDimensions = {sfnn_shard_dims};
 
         // 各層の次元数
-        constexpr IndexType kInputDims   = kTransformedFeatureDimensions;
+        // routerft<R>ft<R> のときは kTransformedFeatureDimensions (FT accumulator幅) より
+        // R だけ狭い (router の生スコア分を除いた実際の特徴量次元)。それ以外は一致する。
+        constexpr IndexType kInputDims   = {main_dims};
         constexpr IndexType kHidden1Dims = {layers[1]};
         constexpr bool kUseShortcut = {"true" if hidden1_uses_shortcut else "false"};
         constexpr IndexType kHidden1OutputDims = kHidden1Dims + (kUseShortcut ? 1 : 0);
@@ -551,6 +849,14 @@ if SFNN:
     elif enable_sparse_sfnn_accumulator_propagate:
         sfnn_accumulator_propagate_macro = "#define NNUE_HAS_SFNN_ACCUMULATOR_PROPAGATE"
 
+    if not sfnn_common_shard and hidden1_output_dims == 16 and int(layers[0]) % 128 == 0:
+        sfnn_accumulator_propagate_macro += """
+        #if defined(NNUE_SFNN_FUSED_FT)
+        #define NNUE_HAS_SFNN_ACCUMULATOR_PROPAGATE
+        #define NNUE_HAS_SFNN16_ACCUMULATOR_PROPAGATE
+        #endif
+        """
+
     structure_string = (
         "SFNN-1536"
         if input_feature == "halfkahm2"
@@ -560,10 +866,16 @@ if SFNN:
     )
 
     header += f"""
+        #if !defined(ENABLE_SFNN_16BIT_WEIGHT)
         {sfnn_accumulator_propagate_macro}
+        #endif
 
         using Fc0Layer = {fc_0_type};
+        #if defined(ENABLE_SFNN_16BIT_WEIGHT)
+        using NetworkBase = SfnnNetwork16<kInputDims, kHidden1Dims, kHidden2Dims, kUseShortcut>;
+        #else
         using NetworkBase = SfnnNetwork<Fc0Layer, kInputDims, kHidden1Dims, kHidden2Dims, kUseShortcut>;
+        #endif
 
         struct Network : NetworkBase {{
             static std::string GetStructureString() {{

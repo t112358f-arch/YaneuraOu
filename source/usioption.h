@@ -161,6 +161,13 @@ class OptionsMap {
     // 通常の"setoption"では変更できない。
     void read_engine_options(const std::string& filename);
 
+    // ENGINE_OPTIONSマクロで、コンパイル時にエンジンオプションを設定する機能。
+    // ";"区切りで複数指定できる。
+    // 例) #define ENGINE_OPTIONS "FV_SCALE=24;BookFile=no_book"
+    // ⚠ read_engine_options()と同様、ここで設定した値はfixedフラグが立ち、
+    //     そのあと通常の"setoption"では変更できない。
+    void set_engine_options(const std::string& options);
+
     // option名を指定して、その値を出力した文字列を構成する。
     // option名が省略された時は、すべてのオプションの値を出力した文字列を構成する。
     std::string get_option(const std::string& option_name);

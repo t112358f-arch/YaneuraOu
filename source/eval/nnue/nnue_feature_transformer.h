@@ -48,7 +48,13 @@ using vec_t = __m512i;
 #define vec_slli_16(a, b) _mm512_slli_epi16(a, b)
 #define vec_packus_16(a, b) _mm512_packus_epi16(a, b)
 #define vec_zero() _mm512_setzero_si512()
-static constexpr IndexType kNumRegs = 8;  // only 8 are needed
+#if defined(NNUE_FT_REGS)
+static_assert(NNUE_FT_REGS >= 1 && NNUE_FT_REGS <= 24, "NNUE_FT_REGS must be in [1, 24]");
+// FT 2304 is the measured configuration; keep other widths unchanged.
+static constexpr IndexType kNumRegs = kTransformedFeatureDimensions == 2304 ? NNUE_FT_REGS : 8;
+#else
+static constexpr IndexType kNumRegs = kTransformedFeatureDimensions == 2304 ? 24 : 8;
+#endif
 
 #elif defined(USE_AVX2)
 using vec_t = __m256i;
@@ -134,7 +140,35 @@ class FeatureTransformer {
    private:
 	// Number of output dimensions for one side
 	// 片側分の出力の次元数
+	//
+	// `--bucket-mode ...routerft{R}ft{R}` (tatara) のnetでは、この
+	// kHalfDimensions (= kTransformedFeatureDimensions) がkInputDims (fc_0の入力幅)
+	// より kRouterFtByFtR だけ広い — router の生スコア (perspectiveごとにR個) が
+	// 同じFTのaccumulator/重み行列に同居するため (評価関数本体のFTと一緒に差分計算される)。
+	// 通常ビルド (TANUKI_ROUTER_ARCH_FTBYFT未定義) では従来通りkInputDimsと完全に一致する。
 	static constexpr IndexType kHalfDimensions = kTransformedFeatureDimensions;
+
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+	static_assert(kRouterFtByFtR >= 1, "kRouterFtByFtR must be >= 1 for routerft<R>ft<R>");
+	static_assert(kRouterFtByFtR % 2 == 0, "kRouterFtByFtR must be even (split R/2 + R/2 across the pairwise halves)");
+	static_assert(kHalfDimensions == kInputDims + kRouterFtByFtR,
+		"routerft<R>ft<R> requires kTransformedFeatureDimensions == kInputDims + R");
+#endif
+	// pairwise-multiplyの折り返し地点 (前半/後半境界)。常に kHalfDimensions/2
+	// (SIMDチャンク境界とのアラインメントは、幅の狭いkInputDimsではなく、この
+	// kHalfDimensions側で保証されている — kVectorHeightの倍数になるよう
+	// アーキテクチャ生成時にRが選ばれる)。
+	static constexpr IndexType kPairSplit = kHalfDimensions / 2;
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+	// pairwise計算した1152個のうち、実際にfc_0へ渡す (=in0/in1双方とも本物の特徴量である)
+	// 先頭 kKeptPerSide 個だけを`output`にコピーする。残り (kRouterFtByFtR/2個、
+	// in0側末尾R/2個 × in1側末尾R/2個の積) はrouter由来の組み合わせで意味を持たないため
+	// 破棄する。router自身の生スコアはこの積からではなく、accumulatorから直接
+	// (`RouterRawScores()`で) 読む。
+	static constexpr IndexType kKeptPerSide = kInputDims / 2;
+#else
+	static constexpr IndexType kKeptPerSide = kPairSplit;
+#endif
 
 #if defined(VECTOR)
 	//static constexpr IndexType kTileHeight = kNumRegs * sizeof(vec_t) / 2;
@@ -153,7 +187,13 @@ class FeatureTransformer {
 	// 入出力の次元数
 	static constexpr IndexType kInputDimensions  = RawFeatures::kDimensions;
 #if defined(USE_ELEMENT_WISE_MULTIPLY)
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+	// routerft<R>ft<R> : pairwise-multiply後にfc_0へ渡すのはkInputDims幅のみ
+	// (router由来の生スコア分は含まない、破棄する)。
+	static constexpr IndexType kOutputDimensions = kInputDims;
+#else
 	static constexpr IndexType kOutputDimensions = kHalfDimensions;
+#endif
 #else
 	static constexpr IndexType kOutputDimensions = kHalfDimensions * 2;
 #endif
@@ -236,6 +276,23 @@ class FeatureTransformer {
 		}
 	}
 
+#if defined(ENABLE_TEST_CMD)
+	// Independent reference for checking both incremental updates and Finny.
+	// Deliberately bypass all cached accumulators.
+	void RefreshAccumulatorForTest(const Position& pos) const {
+		auto& accumulator = pos.state()->accumulator;
+		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
+			Features::IndexList active_indices[2];
+			RawFeatures::AppendActiveIndices(pos, kRefreshTriggers[i], active_indices);
+			for (const auto perspective : COLOR)
+				refresh_accumulator_from_scratch(
+					accumulator.accumulation[perspective][i], active_indices[perspective], i);
+		}
+		accumulator.computed_accumulation = true;
+		accumulator.computed_score = false;
+	}
+#endif
+
 	// Convert input features
 	// 入力特徴量を変換する
 	void Transform(const Position& pos, OutputType* output, bool refresh) const {
@@ -251,19 +308,31 @@ class FeatureTransformer {
 #else
 			constexpr IndexType OutputChunkSize = kSimdWidth;
 #endif
-		static_assert((kHalfDimensions / 2) % OutputChunkSize == 0);
-		constexpr IndexType NumOutputChunks = kHalfDimensions / 2 / OutputChunkSize;
+		static_assert(kPairSplit % OutputChunkSize == 0);
+		constexpr IndexType NumOutputChunks = kPairSplit / OutputChunkSize;
 
 		vec_t Zero = vec_zero();
 		vec_t One = vec_set_16(127 * 2);
 
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+		// pairwise結果をいったんscratchに全部 (kPairSplit幅) 書き、後で先頭
+		// kKeptPerSide個だけを`output`へコピーする (末尾のrouter由来の組み合わせは
+		// SIMDチャンク単位では綺麗に切り捨てられないため、要素単位のmemcpyで捨てる)。
+		alignas(kCacheLineSize) OutputType scratch[2][kPairSplit];
+#endif
+
 		const Color perspectives[2] = { pos.side_to_move(), ~pos.side_to_move() };
 		for (IndexType p = 0; p < 2; ++p) {
-			const IndexType offset = (kHalfDimensions / 2) * p;
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+			OutputType* out_ptr = scratch[p];
+#else
+			const IndexType offset = kKeptPerSide * p;
+			OutputType* out_ptr = output + offset;
+#endif
 
 			const vec_t* in0 = reinterpret_cast<const vec_t*>(&(accumulation[perspectives[p]][0][0]));
-			const vec_t* in1 = reinterpret_cast<const vec_t*>(&(accumulation[perspectives[p]][0][kHalfDimensions / 2]));
-			vec_t* out = reinterpret_cast<vec_t*>(output + offset);
+			const vec_t* in1 = reinterpret_cast<const vec_t*>(&(accumulation[perspectives[p]][0][kPairSplit]));
+			vec_t* out = reinterpret_cast<vec_t*>(out_ptr);
 
 			constexpr int shift =
 #if defined(USE_SSE2)
@@ -289,6 +358,14 @@ class FeatureTransformer {
 
 		}
 
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+		// scratch (perspectiveごとkPairSplit幅) の先頭kKeptPerSide個だけをoutputへコピーする。
+		// (残り = router由来の組み合わせで、router_ftft_bucket()はこの積ではなく
+		//  accumulatorの生値を`RouterRawScores()`経由で直接読むので、ここは単純に捨てるだけでよい)
+		for (IndexType p = 0; p < 2; ++p)
+			std::memcpy(output + kKeptPerSide * p, scratch[p], kKeptPerSide * sizeof(OutputType));
+#endif
+
 #else
 		constexpr int shift =
 #if defined(VECTOR) && !defined(USE_SSE2)
@@ -299,17 +376,20 @@ class FeatureTransformer {
 
 		const Color perspectives[2] = { pos.side_to_move(), ~pos.side_to_move() };
 		for (IndexType p = 0; p < 2; ++p) {
-			const IndexType offset = (kHalfDimensions / 2) * p;
+			const IndexType offset = kKeptPerSide * p;
 
-			for (IndexType j = 0; j < kHalfDimensions / 2; ++j)
+			for (IndexType j = 0; j < kPairSplit; ++j)
 			{
 				BiasType sum0 = accumulation[perspectives[p]][0][j];
-				BiasType sum1 = accumulation[perspectives[p]][0][j + kHalfDimensions / 2];
+				BiasType sum1 = accumulation[perspectives[p]][0][j + kPairSplit];
 				sum0 = std::clamp<BiasType>(sum0, 0, 127 * 2);
 				sum1 = std::clamp<BiasType>(sum1, 0, 127 * 2);
 				const int product = (int(sum0) << shift) * int(sum1);
 				const int value = product >> 16;
-				output[offset + j] = static_cast<OutputType>(std::clamp(value, 0, 255));
+				// kKeptPerSide個を超える分 (routerft<R>ft<R>のみ発生) はrouter由来の
+				// 組み合わせで意味を持たないため書き出さない (捨てる)。
+				if (j < kKeptPerSide)
+					output[offset + j] = static_cast<OutputType>(std::clamp(value, 0, 255));
 			}
 
 		}
@@ -450,6 +530,24 @@ class FeatureTransformer {
 #endif
 	}
 
+#if defined(TANUKI_ROUTER_ARCH_FTBYFT)
+	// routerft<R>ft<R> : 指定perspectiveのrouter生スコアR個 (pairwise-multiply対象外の
+	// 未加工値) を`out`に書く。in0側末尾R/2個・in1側末尾R/2個 (accumulator上は
+	// [kKeptPerSide,kPairSplit) と [kPairSplit+kKeptPerSide,kHalfDimensions) の2箇所に
+	// 分かれている — Transform()のpairwise計算で、この2箇所同士の積だけが
+	// 「router由来の組み合わせ」として破棄されるように配置してあるため) を連結して返す。
+	// 呼び出し前に`UpdateAccumulatorIfPossible`/`refresh_accumulator`等で
+	// accumulatorが計算済みであることが前提 (Transform()と同じ差分計算の恩恵を受ける)。
+	void RouterRawScores(const Position& pos, Color perspective, BiasType (&out)[kRouterFtByFtR]) const {
+		const auto* acc = pos.state()->accumulator.accumulation[perspective][0];
+		constexpr IndexType kHalfR = kRouterFtByFtR / 2;
+		for (IndexType i = 0; i < kHalfR; ++i)
+			out[i] = acc[kKeptPerSide + i];
+		for (IndexType i = 0; i < kHalfR; ++i)
+			out[kHalfR + i] = acc[kPairSplit + kKeptPerSide + i];
+	}
+#endif
+
    private:
 	static void order_packs([[maybe_unused]] uint64_t* v) {
 #if defined(USE_AVX512)  // _mm512_set_epi32 packs in the order [15 11 7 3 14 10 6 2 13 9 5 1 12 8 4 0]
@@ -533,6 +631,39 @@ class FeatureTransformer {
 	}();
 	static constexpr IndexType kTileHeight = kTileRegs * kVectorHeight;
 
+#if defined(NNUE_FT_SPECIALIZED)
+	template <IndexType Removed, IndexType Added>
+	void update_accumulator_fixed(const BiasType* source, BiasType* destination,
+	                              const Features::IndexList& removed,
+	                              const Features::IndexList& added) const {
+		const WeightType* remove_columns[Removed];
+		const WeightType* add_columns[Added];
+		for (IndexType n = 0; n < Removed; ++n)
+			remove_columns[n] = weights_ + kHalfDimensions * removed[n];
+		for (IndexType n = 0; n < Added; ++n)
+			add_columns[n] = weights_ + kHalfDimensions * added[n];
+		for (IndexType offset = 0; offset < kHalfDimensions; offset += kTileHeight) {
+			vec_t acc[kTileRegs];
+			const auto* src = reinterpret_cast<const vec_t*>(source + offset);
+			for (IndexType k = 0; k < kTileRegs; ++k)
+				acc[k] = vec_load(src + k);
+			for (IndexType n = 0; n < Removed; ++n) {
+				const auto* column = reinterpret_cast<const vec_t*>(remove_columns[n] + offset);
+				for (IndexType k = 0; k < kTileRegs; ++k)
+					acc[k] = vec_sub_16(acc[k], vec_load(column + k));
+			}
+			for (IndexType n = 0; n < Added; ++n) {
+				const auto* column = reinterpret_cast<const vec_t*>(add_columns[n] + offset);
+				for (IndexType k = 0; k < kTileRegs; ++k)
+					acc[k] = vec_add_16(acc[k], vec_load(column + k));
+			}
+			auto* dst = reinterpret_cast<vec_t*>(destination + offset);
+			for (IndexType k = 0; k < kTileRegs; ++k)
+				vec_store(dst + k, acc[k]);
+		}
+	}
+#endif
+
 	template <typename ApplyChanges>
 	void update_accumulator_tiled(
 		const BiasType* source, BiasType* destination,
@@ -600,6 +731,15 @@ class FeatureTransformer {
 		}
 	};
 
+	FinnyCache& finny_cache() const {
+		static thread_local std::unique_ptr<FinnyCache> cache;
+		if (!cache)
+			cache = std::make_unique<FinnyCache>();
+		if (cache->owner != this || cache->generation != finny_generation_)
+			cache->reset(this, finny_generation_);
+		return *cache;
+	}
+
 	static Square finny_bucket_square(
 		const Position& pos, Features::TriggerEvent trigger, Color perspective) {
 		switch (trigger) {
@@ -614,6 +754,26 @@ class FeatureTransformer {
 		}
 	}
 
+#if defined(NNUE_FINNY_CANCEL)
+	static void cancel_common_indices(Features::IndexList& removed, Features::IndexList& added) {
+		if (removed.size() < 2 || added.size() < 2)
+			return;
+		// Multiset difference: preserve repeated features (e.g. missing pieces).
+		std::sort(removed.begin(), removed.end());
+		std::sort(added.begin(), added.end());
+		std::size_t r = 0, a = 0, r_out = 0, a_out = 0;
+		while (r < removed.size() && a < added.size()) {
+			if (removed[r] == added[a]) { ++r; ++a; }
+			else if (removed[r] < added[a]) removed[r_out++] = removed[r++];
+			else added[a_out++] = added[a++];
+		}
+		while (r < removed.size()) removed[r_out++] = removed[r++];
+		while (a < added.size()) added[a_out++] = added[a++];
+		removed.resize(r_out);
+		added.resize(a_out);
+	}
+#endif
+
 	static void make_index_diff(
 		const Features::IndexList& old_active,
 		const Features::IndexList& new_active,
@@ -626,6 +786,9 @@ class FeatureTransformer {
 				removed.push_back(old_active[i]);
 				added.push_back(new_active[i]);
 			}
+#if defined(NNUE_FINNY_CANCEL)
+			cancel_common_indices(removed, added);
+#endif
 			return;
 		}
 
@@ -718,7 +881,15 @@ class FeatureTransformer {
 		FinnyEntry& entry,
 		const Features::IndexList& active_indices,
 		IndexType trigger_index) const {
-		if (!entry.initialized) {
+		Features::IndexList removed_indices, added_indices;
+		if (entry.initialized)
+			make_index_diff(entry.active_indices, active_indices, removed_indices, added_indices);
+		bool rebuild = !entry.initialized;
+#if defined(USE_FINNY_RESET)
+		// Avoid reading more weight columns than rebuilding from the bias.
+		rebuild = rebuild || removed_indices.size() + added_indices.size() >= active_indices.size();
+#endif
+		if (rebuild) {
 #if defined(VECTOR)
 			const auto* source = trigger_index == 0 ? biases_ : nullptr;
 			update_accumulator_tiled_to_two(
@@ -734,9 +905,6 @@ class FeatureTransformer {
 			copy_index_list(entry.active_indices, active_indices);
 			entry.initialized = true;
 		} else {
-			Features::IndexList removed_indices, added_indices;
-			make_index_diff(entry.active_indices, active_indices, removed_indices, added_indices);
-
 #if defined(VECTOR)
 			update_accumulator_tiled_to_two(
 				entry.accumulation, entry.accumulation, current,
@@ -766,11 +934,7 @@ class FeatureTransformer {
 	}
 
 	void refresh_accumulator_with_finny_cache(const Position& pos) const {
-		static thread_local std::unique_ptr<FinnyCache> cache;
-		if (!cache)
-			cache = std::make_unique<FinnyCache>();
-		if (cache->owner != this || cache->generation != finny_generation_)
-			cache->reset(this, finny_generation_);
+		auto& cache = finny_cache();
 
 		auto& accumulator = pos.state()->accumulator;
 		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
@@ -780,7 +944,7 @@ class FeatureTransformer {
 			for (int c = 0; c < COLOR_NB; ++c) {
 				const Color perspective = static_cast<Color>(c);
 				const Square bucket = finny_bucket_square(pos, trigger, perspective);
-				auto& entry = cache->entries[i][perspective][bucket];
+				auto& entry = cache.entries[i][perspective][bucket];
 				refresh_accumulator_using_finny_entry(
 					accumulator.accumulation[perspective][i], entry,
 					active_indices[perspective], i);
@@ -834,6 +998,21 @@ class FeatureTransformer {
 			RawFeatures::AppendChangedIndices(pos, kRefreshTriggers[i], removed_indices, added_indices, reset);
 			for (int c = 0; c < COLOR_NB; ++c) {
 				const Color perspective = static_cast<Color>(c);
+#if defined(USE_FINNY_TABLES) && defined(USE_FINNY_RESET)
+				if constexpr (kUseFinnyTables) {
+					if (reset[perspective]) {
+						auto& cache = finny_cache();
+						const auto bucket = finny_bucket_square(pos, kRefreshTriggers[i], perspective);
+						auto& entry = cache.entries[i][perspective][bucket];
+						// On reset, added_indices contains every active feature.
+						// The other perspective keeps its ordinary incremental update.
+						refresh_accumulator_using_finny_entry(
+							accumulator.accumulation[perspective][i], entry,
+							added_indices[perspective], i);
+						continue;
+					}
+				}
+#endif
 #if defined(VECTOR)
 				auto* current = accumulator.accumulation[perspective][i];
 				if (reset[perspective]) {
@@ -845,6 +1024,19 @@ class FeatureTransformer {
 								add_weight_to_tile(acc, index, tile_offset);
 						});
 				} else {
+#if defined(NNUE_FT_SPECIALIZED)
+					const auto& removed = removed_indices[perspective];
+					const auto& added = added_indices[perspective];
+					const auto* source = prev_accumulator.accumulation[perspective][i];
+					if (removed.size() == 1 && added.size() == 1) {
+						update_accumulator_fixed<1, 1>(source, current, removed, added);
+						continue;
+					}
+					if (removed.size() == 2 && added.size() == 2) {
+						update_accumulator_fixed<2, 2>(source, current, removed, added);
+						continue;
+					}
+#endif
 					update_accumulator_tiled(
 						prev_accumulator.accumulation[perspective][i],
 						current,

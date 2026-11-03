@@ -366,18 +366,19 @@ std::ostream& operator<<(std::ostream& os, const OptionsMap& om) {
 	// 評価関数を読み込んだかのフラグ。これはevaldirの変更にともなってfalseにする。
 	bool load_eval_finished = false;
 
-	// エンジンオプションをコンパイル時に設定する機能
-	// "ENGINE_OPTIONS"で指定した内容を設定する。
-	// 例) #define ENGINE_OPTIONS "FV_SCALE=24;BookFile=no_book"
-	void set_engine_options(const std::string& options)
-	{
-		// ";"で区切って複数指定できるものとする。
-		auto v = StringExtension::Split(options, ";");
-		for (auto line : v)
-			build_option(std::string(line));
-	}
-
 #endif
+
+// エンジンオプションをコンパイル時に設定する機能
+// "ENGINE_OPTIONS"で指定した内容を設定する。
+// 例) #define ENGINE_OPTIONS "FV_SCALE=24;BookFile=no_book"
+// 📝 USIEngine::set_engine()から、すべてのオプションが生えたあとに呼び出される。
+void OptionsMap::set_engine_options(const std::string& options)
+{
+	// ";"で区切って複数指定できるものとする。
+	auto v = StringExtension::Split(options, ";");
+	for (auto line : v)
+		build_option(std::string(line));
+}
 
 // --------------------
 //  やねうら王独自拡張

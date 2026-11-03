@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -82,6 +84,19 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
                     return std::nullopt;
                 }));
 
+#if defined(__EMSCRIPTEN__)
+    // 📝 wasmでは評価関数ファイル名をJS側から指定できるようにする。
+    //     JS側はEmscriptenの仮想FSにファイルを書き出したあと、
+    //     "setoption name EvalFile value ..."を送ってくる。
+    // ⚠ load_eval()はwasmのとき、EvalDirが"<internal>"でもOptions["EvalFile"]を
+    //     参照するので、埋め込み版でもこのOptionは必要。
+    Options.add("EvalFile", Option(EvalFileDefaultName, [](const Option&) {
+                    // 評価関数ファイル名の変更に際して、読み込みフラグをクリアする。
+                    eval_loaded = false;
+                    return std::nullopt;
+                }));
+#endif
+
     // NNUEのFV_SCALEの値
     Options.add("FV_SCALE", Option(16, 1, 128, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FV_SCALE = int(o);
@@ -108,7 +123,16 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
 //     const unsigned int         gEmbeddedNNUESize;    // 埋め込まれたファイルのサイズ
 // なお、この方法は Microsoft Visual Studio では動作しません。
 
-#if !defined(_MSC_VER) && !defined(NNUE_EMBEDDING_OFF)
+#if defined(__EMSCRIPTEN__) && !defined(NNUE_EMBEDDING_OFF)
+// 📝 WebAssemblyではincbin.hは使えない。incbin.hはモジュールレベルのinline asmで
+//     データシンボルを置くが、wasmはデータシンボルをtextセクションに置けないため
+//     "data symbols must live in a data section"となる。-fltoではアセンブルが
+//     リンク時まで遅延されるので、コンパイルは通りwasm-ldがSIGABRTで落ちる。
+//     代わりに、パラメーターを文字列リテラルとして持つembedded_nnue.cpp
+//     (script/wasm_build.jsが生成)をリンクする。
+extern const char*       gEmbeddedNNUEData;
+extern const std::size_t gEmbeddedNNUESize;
+#elif !defined(_MSC_VER) && !defined(NNUE_EMBEDDING_OFF)
 INCBIN(EmbeddedNNUE, EvalFileDefaultName);
 #else
 const unsigned char        gEmbeddedNNUEData[1] = { 0x0 };
@@ -143,7 +167,14 @@ namespace {
 	// ⇨  StockfishはNNUEとして大きなnetworkと小さなnetworkがある。
 
 	EmbeddedNNUE get_embedded() {
+#if defined(__EMSCRIPTEN__) && !defined(NNUE_EMBEDDING_OFF)
+		// embedded_nnue.cppは先頭ポインタとサイズしか提供しないので、終端はここで計算する。
+		const auto* data = reinterpret_cast<const unsigned char*>(gEmbeddedNNUEData);
+		return EmbeddedNNUE(data, data + gEmbeddedNNUESize,
+			static_cast<unsigned int>(gEmbeddedNNUESize));
+#else
 		return EmbeddedNNUE(gEmbeddedNNUEData, gEmbeddedNNUEEnd, gEmbeddedNNUESize);
+#endif
 	}
 }
 
@@ -159,12 +190,12 @@ namespace Progress {
 namespace {
 
 	constexpr double kQ16Scale = 65536.0;
-	constexpr int kProgressThresholdCount = Parameters::kProgressValueCount - 1;
+	constexpr int kProgressThresholdCount = NNUE_SFNN_PROGRESS_BUCKETS - 1;
 
 	std::array<std::int64_t, kProgressThresholdCount> make_thresholds_q16() {
 		std::array<std::int64_t, kProgressThresholdCount> thresholds{};
-		for (int i = 1; i < Parameters::kProgressValueCount; ++i) {
-			const double p = double(i) / double(Parameters::kProgressValueCount);
+		for (int i = 1; i < NNUE_SFNN_PROGRESS_BUCKETS; ++i) {
+			const double p = double(i) / double(NNUE_SFNN_PROGRESS_BUCKETS);
 			const double scaled = std::round(std::log(p / (1.0 - p)) * kQ16Scale);
 			const double clamped = std::clamp(
 			    scaled,
@@ -180,27 +211,69 @@ namespace {
 		return thresholds;
 	}
 
-	int progress_0_to_255_from_sum_q16(std::int64_t sum_q16) {
-		const auto& thresholds = thresholds_q16();
+	// 旧形式 (nn.bin埋め込み) のbucket境界。旧実装は
+	//   progress = (しきい値255個のうち sum_q16 以下のものの個数) ∈ [0,255]
+	//   bucket   = progress * N / 256
+	// だったので、bucket k (k=1..N-1) に入る最小のprogressは ceil(256k/N)。
+	// その境界は logit(ceil(256k/N)/256) になる。Nが2の冪なら thresholds_q16() と一致する。
+	std::array<std::int64_t, kProgressThresholdCount> make_legacy_thresholds_q16() {
+		std::array<std::int64_t, kProgressThresholdCount> thresholds{};
+		for (int k = 1; k < NNUE_SFNN_PROGRESS_BUCKETS; ++k) {
+			const int m = (256 * k + NNUE_SFNN_PROGRESS_BUCKETS - 1) / NNUE_SFNN_PROGRESS_BUCKETS;
+			const double p = double(m) / 256.0;
+			const double scaled = std::round(std::log(p / (1.0 - p)) * kQ16Scale);
+			const double clamped = std::clamp(
+			    scaled,
+			    double((std::numeric_limits<std::int64_t>::min)()),
+			    double((std::numeric_limits<std::int64_t>::max)()));
+			thresholds[k - 1] = std::int64_t(clamped);
+		}
+		return thresholds;
+	}
+
+	const std::array<std::int64_t, kProgressThresholdCount>& legacy_thresholds_q16() {
+		static const auto thresholds = make_legacy_thresholds_q16();
+		return thresholds;
+	}
+
+	int bucket_from_sum_q16(std::int64_t sum_q16, bool legacy) {
+		const auto& thresholds = legacy ? legacy_thresholds_q16() : thresholds_q16();
 		const auto it = std::upper_bound(thresholds.begin(), thresholds.end(), sum_q16);
 		return int(it - thresholds.begin());
 	}
 
 } // namespace
 
-Tools::Result Parameters::ReadParameters(std::istream& stream) {
+Tools::Result Parameters::ReadLegacyParameters(std::istream& stream) {
 	bias_q16_ = read_little_endian<std::int32_t>(stream);
 	read_little_endian<std::int32_t>(stream, &weights_q16_[0][0], kWeightCount);
+	legacy_thresholds_ = true;
 	return !stream.fail() ? Tools::ResultCode::Ok : Tools::ResultCode::FileReadError;
 }
 
-bool Parameters::WriteParameters(std::ostream& stream) const {
-	stream.write(reinterpret_cast<const char*>(&bias_q16_), sizeof(bias_q16_));
-	stream.write(reinterpret_cast<const char*>(&weights_q16_[0][0]), sizeof(weights_q16_));
-	return !stream.fail();
+Tools::Result Parameters::ReadParameters(std::istream& stream) {
+	bias_q16_ = 0;
+	legacy_thresholds_ = false;
+	static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
+	static_assert(kWeightCount == 81 * 1548);
+	for (auto& row : weights_q16_)
+		for (auto& weight : row) {
+			const auto bits = read_little_endian<std::uint64_t>(stream);
+			if (stream.fail()) return Tools::ResultCode::FileReadError;
+			double value;
+			std::memcpy(&value, &bits, sizeof(value));
+			// Check the IEEE exponent directly, also with -ffast-math enabled.
+			if ((bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+				return Tools::ResultCode::FileMismatch;
+			weight = std::int32_t(std::clamp(std::round(value * kQ16Scale),
+			    double((std::numeric_limits<std::int32_t>::min)()),
+			    double((std::numeric_limits<std::int32_t>::max)())));
+		}
+	return stream.peek() == std::ios::traits_type::eof()
+	    ? Tools::ResultCode::Ok : Tools::ResultCode::FileMismatch;
 }
 
-int Parameters::Value0To255(const Position& pos) const {
+std::int64_t Parameters::SumQ16(const Position& pos) const {
 	const auto sq_bk = pos.square<KING>(BLACK);
 	const auto sq_wk = Inv(pos.square<KING>(WHITE));
 
@@ -228,19 +301,115 @@ int Parameters::Value0To255(const Position& pos) const {
 		st->nnue_progress_valid = true;
 	}
 
-	return progress_0_to_255_from_sum_q16(sum_q16);
+	return sum_q16;
 }
 
 int Parameters::BucketIndex(const Position& pos, int bucket_count) const {
 	if (bucket_count <= 1)
 		return 0;
 
-	const int progress = Value0To255(pos);
-	const int bucket = progress * bucket_count / kProgressValueCount;
-	return std::clamp(bucket, 0, bucket_count - 1);
+	ASSERT_LV1(bucket_count == NNUE_SFNN_PROGRESS_BUCKETS);
+	return bucket_from_sum_q16(SumQ16(pos), legacy_thresholds_);
 }
 
 } // namespace Progress
+#endif
+
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+namespace RouterKPAbs {
+
+Tools::Result Parameters::ReadParameters(std::istream& stream) {
+	// ファイル上はkN列 (パディング無し) — kNPadded分のstrideではなく、
+	// 1行 (1 sq/piece あたり) kN 個ずつ読み、weights_q16_[sq][piece]の
+	// 先頭kN個に詰める (末尾 [kN, kNPadded) はメンバ初期化子の0のまま)。
+	constexpr int kFlatCount = int(SQ_NB) * int(Eval::fe_end) * kN;
+	std::vector<std::int32_t> flat(kFlatCount);
+	read_little_endian<std::int32_t>(stream, flat.data(), kFlatCount);
+	if (stream.fail())
+		return Tools::ResultCode::FileReadError;
+
+	int idx = 0;
+	for (int sq = 0; sq < int(SQ_NB); ++sq)
+		for (int p = 0; p < int(Eval::fe_end); ++p)
+			for (int k = 0; k < kN; ++k)
+				weights_q16_[sq][p][k] = flat[idx++];
+	return Tools::ResultCode::Ok;
+}
+
+bool Parameters::WriteParameters(std::ostream& stream) const {
+	// ReadParameters()と対称: パディング列 [kN, kNPadded) は書かない。
+	constexpr int kFlatCount = int(SQ_NB) * int(Eval::fe_end) * kN;
+	std::vector<std::int32_t> flat(kFlatCount);
+	int idx = 0;
+	for (int sq = 0; sq < int(SQ_NB); ++sq)
+		for (int p = 0; p < int(Eval::fe_end); ++p)
+			for (int k = 0; k < kN; ++k)
+				flat[idx++] = weights_q16_[sq][p][k];
+	stream.write(reinterpret_cast<const char*>(flat.data()),
+		sizeof(std::int32_t) * static_cast<size_t>(kFlatCount));
+	return !stream.fail();
+}
+
+// progress8kpabs (Progress::Parameters::Value0To255) と同じ特徴 (両perspectiveの
+// KP-absolute active feature) について、bias無しの重み和を bucket = 0..kN それぞれ
+// 求め、argmaxのbucketを返す。
+//
+// k (=bucket候補) 方向、kRouterSimdWidth個ずつをTARGET_CPUのSIMDで並列に累積する
+// (weights_q16_はkNPadded列にパディング済み — struct Parametersのコメント参照)。
+// 累積はint32で行う (PIECE_NUMBER_KING <= 38 なので両perspective合計で最大76項の
+// 和になるが、学習済みQ16.16重みの実用的な値域ではint32のオーバーフローは
+// 起きない想定。より安全側に振りたい場合はint64累積へ拡張すること)。
+int Parameters::BucketIndex(const Position& pos) const {
+	const auto sq_bk = pos.square<KING>(BLACK);
+	const auto sq_wk = Inv(pos.square<KING>(WHITE));
+
+	const auto& list0 = pos.eval_list()->piece_list_fb();
+	const auto& list1 = pos.eval_list()->piece_list_fw();
+
+	alignas(kCacheLineSize) std::int32_t logits[kNPadded] = {};
+	constexpr int kNumChunks = kNPadded / kRouterSimdWidth;
+
+	for (int i = 0; i < PIECE_NUMBER_KING; ++i) {
+		const std::int32_t* row_bk = &weights_q16_[sq_bk][list0[i]][0];
+		const std::int32_t* row_wk = &weights_q16_[sq_wk][list1[i]][0];
+		for (int c = 0; c < kNumChunks; ++c) {
+			const int off = c * kRouterSimdWidth;
+#if defined(USE_AVX512)
+			__m512i acc = _mm512_loadu_si512(reinterpret_cast<const void*>(&logits[off]));
+			acc = _mm512_add_epi32(acc, _mm512_loadu_si512(reinterpret_cast<const void*>(&row_bk[off])));
+			acc = _mm512_add_epi32(acc, _mm512_loadu_si512(reinterpret_cast<const void*>(&row_wk[off])));
+			_mm512_storeu_si512(reinterpret_cast<void*>(&logits[off]), acc);
+#elif defined(USE_AVX2)
+			__m256i acc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&logits[off]));
+			acc = _mm256_add_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&row_bk[off])));
+			acc = _mm256_add_epi32(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&row_wk[off])));
+			_mm256_storeu_si256(reinterpret_cast<__m256i*>(&logits[off]), acc);
+#elif defined(USE_SSE2)
+			__m128i acc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&logits[off]));
+			acc = _mm_add_epi32(acc, _mm_loadu_si128(reinterpret_cast<const __m128i*>(&row_bk[off])));
+			acc = _mm_add_epi32(acc, _mm_loadu_si128(reinterpret_cast<const __m128i*>(&row_wk[off])));
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(&logits[off]), acc);
+#elif defined(USE_NEON)
+			int32x4_t acc = vld1q_s32(&logits[off]);
+			acc = vaddq_s32(acc, vld1q_s32(&row_bk[off]));
+			acc = vaddq_s32(acc, vld1q_s32(&row_wk[off]));
+			vst1q_s32(&logits[off], acc);
+#else
+			// SIMD命令が使えないTARGET_CPU (kRouterSimdWidth == 1 のスカラー
+			// フォールバック)。
+			logits[off] += row_bk[off] + row_wk[off];
+#endif
+		}
+	}
+
+	int best = 0;
+	for (int k = 1; k < kN; ++k)
+		if (logits[k] > logits[best])
+			best = k;
+	return best;
+}
+
+} // namespace RouterKPAbs
 #endif
 
     // NNUE評価関数パラメーター（共有メモリまたはローカルメモリ上に配置）
@@ -248,6 +417,18 @@ int Parameters::BucketIndex(const Position& pos, int bucket_count) const {
 
     // 評価関数ファイル名
     const char* const kFileName = EvalFileDefaultName;
+
+#if defined(ENABLE_SFNN_16BIT_WEIGHT)
+    static std::string Nn16Architecture(std::uint32_t qb) {
+        return "ModelType=SFNNWithoutPsqt;Features=" + FeatureTransformer::GetStructureString()
+            + ",Network=SFNN-" + std::to_string(Network::kInputDims)
+            + "{LayerStack=" + std::to_string(kLayerStacks)
+            + "};FCWeightBits=16;QB=" + std::to_string(qb)
+            + ";H1=" + std::to_string(Network::kHidden1Dims)
+            + ";Skip=" + std::to_string(int(Network::kUseShortcut))
+            + ";H2=" + std::to_string(Network::kHidden2Dims);
+    }
+#endif
 
     // 評価関数の構造を表す文字列を取得する
     std::string GetArchitectureString() {
@@ -287,7 +468,7 @@ namespace {
 
 	// テンポラリにパラメータを読み込み、共有メモリに配置する。
 	// 同じパラメータを持つ他プロセスが既に共有メモリを作成済みなら、そちらを参照する。
-	Tools::Result LoadAndShare(std::istream& stream) {
+	Tools::Result LoadAndShare(std::istream& stream, [[maybe_unused]] std::string* failed_file) {
 		// テンポラリ領域にパラメータを読み込む
 		auto tmp = make_unique_large_page<NnueNetworks>();
 
@@ -295,7 +476,37 @@ namespace {
 		std::string architecture;
 		Tools::Result result = ReadHeader(stream, &hash_value, &architecture, nullptr);
 		if (result.is_not_ok()) return result;
-		if (hash_value != kHashValue) {
+#if defined(ENABLE_SFNN_16BIT_WEIGHT)
+        const auto qb = read_little_endian<std::uint32_t>(stream);
+        if (!stream) return Tools::ResultCode::FileReadError;
+        for (auto& network : tmp->network)
+            if (!network.SetWeightScale(qb)) {
+                sync_cout << "info string Invalid nn16 QB: " << qb << sync_endl;
+                return Tools::ResultCode::FileMismatch;
+            }
+        if (hash_value != kHashValue || architecture != Nn16Architecture(qb)) {
+            sync_cout << "info string nn16 architecture mismatch: " << architecture
+                      << " expected " << Nn16Architecture(qb) << sync_endl;
+            return Tools::ResultCode::FileMismatch;
+        }
+#endif
+#if defined(SFNNwoPSQT) && NNUE_SFNN_PROGRESS_BUCKETS != 1
+		// 旧形式: progressをnn.bin内 (FTの直後) に埋め込んでいた。
+		// hashにprogress分が混ざる出力もあるが、混ざらない (baseのまま) 出力もあるため、
+		// hashだけでは判別できない。ここではhashによる判定のみ行い、FT読み込み後に
+		// 直後のセクションのマーカーでも判定する。
+		bool legacy_progress =
+		    hash_value == (kHashValue ^ Progress::Parameters::kLegacySectionHash);
+#else
+		constexpr bool legacy_progress = false;
+#endif
+#if defined(SFNNwoPSQT)
+		// router/WSB/progressの有無によらずbaseのhashを書き出す学習側の出力も受け付ける。
+		const bool base_hash = hash_value == kSfnnBaseHashValue;
+#else
+		constexpr bool base_hash = false;
+#endif
+		if (hash_value != kHashValue && !legacy_progress && !base_hash) {
 			sync_cout << "info string Warning: NNUE hash mismatch: expected " << kHashValue
 				<< " got " << hash_value
 				<< " arch_in_file=" << architecture
@@ -309,9 +520,52 @@ namespace {
 			return result;
 		}
 #if defined(SFNNwoPSQT) && NNUE_SFNN_PROGRESS_BUCKETS != 1
-		result = Detail::ReadParameters<Progress::Parameters>(stream, tmp->progress);
+		if (!legacy_progress) {
+			// FT直後のセクションがProgress (oPRO) なら旧形式。先頭4バイトだけ覗いて元の位置に戻す。
+			const auto section_pos = stream.tellg();
+			if (section_pos != std::streampos(-1)) {
+				const auto magic = read_little_endian<std::uint32_t>(stream);
+				const bool read_ok = !stream.fail();
+				stream.clear();
+				stream.seekg(section_pos);
+				if (stream.fail()) return Tools::ResultCode::FileReadError;
+				legacy_progress = read_ok && magic == Progress::Parameters::kLegacySectionHash;
+			}
+		}
+		if (legacy_progress) {
+			// 旧形式: nn.bin内のProgressセクション (hash(u32) + bias + weights) を読む。
+			// この場合 progress.bin は使わない。
+			sync_cout << "info string progress section found in nn.bin (legacy format)" << sync_endl;
+			const auto section_hash = read_little_endian<std::uint32_t>(stream);
+			if (stream.fail()) return Tools::ResultCode::FileReadError;
+			if (section_hash != Progress::Parameters::kLegacySectionHash)
+				sync_cout << "info string Warning: nn.bin progress section hash mismatch." << sync_endl;
+			result = tmp->progress.ReadLegacyParameters(stream);
+			if (result.is_not_ok()) {
+				sync_cout << "info string NNUE progress params read failed: " << result.to_string() << sync_endl;
+				return result;
+			}
+		} else {
+		const std::string eval_dir = Options["EvalDir"];
+		const auto progress_path = Path::Combine(
+		    Path::Combine(Directory::GetBinaryFolder(), eval_dir), "progress.bin");
+		std::ifstream progress_stream(progress_path, std::ios::binary);
+		sync_cout << "info string loading progress file : " << progress_path << sync_endl;
+		result = progress_stream.is_open()
+		    ? tmp->progress.ReadParameters(progress_stream)
+		    : Tools::Result(Tools::ResultCode::FileNotFound);
 		if (result.is_not_ok()) {
-			sync_cout << "info string NNUE progress params read failed: " << result.to_string() << sync_endl;
+			if (failed_file) *failed_file = progress_path;
+			sync_cout << "info string NNUE progress params read failed: " << progress_path
+			          << " : " << result.to_string() << sync_endl;
+			return result;
+		}
+		}
+#endif
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+		result = Detail::ReadParameters<RouterKPAbs::Parameters>(stream, tmp->router_kpabs);
+		if (result.is_not_ok()) {
+			sync_cout << "info string NNUE router(kpabs) params read failed: " << result.to_string() << sync_endl;
 			return result;
 		}
 #endif
@@ -365,15 +619,22 @@ namespace {
     }
 
     	// 評価関数パラメータを読み込む
-    	Tools::Result ReadParameters(std::istream& stream) {
-    		return LoadAndShare(stream);
-    	}
+    Tools::Result ReadParameters(std::istream& stream, std::string* failed_file) {
+        return LoadAndShare(stream, failed_file);
+    }
     // 評価関数パラメータを書き込む
     bool WriteParameters(std::ostream& stream) {
+#if defined(ENABLE_SFNN_16BIT_WEIGHT)
+        const auto qb = networks().network[0].weight_scale;
+        if (!WriteHeader(stream, kHashValue, Nn16Architecture(qb))) return false;
+        for (int i = 0; i < 4; ++i)
+            stream.put(static_cast<char>((qb >> (8 * i)) & 255));
+#else
         if (!WriteHeader(stream, kHashValue, GetArchitectureString())) return false;
+#endif
         if (!Detail::WriteParameters<FeatureTransformer>(stream, networks().feature_transformer)) return false;
-#if defined(SFNNwoPSQT) && NNUE_SFNN_PROGRESS_BUCKETS != 1
-        if (!Detail::WriteParameters<Progress::Parameters>(stream, networks().progress)) return false;
+#if defined(SFNNwoPSQT) && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+        if (!Detail::WriteParameters<RouterKPAbs::Parameters>(stream, networks().router_kpabs)) return false;
 #endif
         for (int i = 0; i < kLayerStacks; ++i) {
             if (!Detail::WriteParameters<Network>(stream, networks().network[i])) return false;
@@ -418,8 +679,50 @@ namespace {
         || NNUE_SFNN_PROGRESS_BUCKETS == 8 || NNUE_SFNN_PROGRESS_BUCKETS == 16
         || NNUE_SFNN_PROGRESS_BUCKETS == 32,
         "unsupported NNUE_SFNN_PROGRESS_BUCKETS");
-    static_assert(kLayerStacks == NNUE_SFNN_HAND_BUCKETS * NNUE_SFNN_KING_BUCKETS * NNUE_SFNN_PROGRESS_BUCKETS,
-        "LayerStacks must match the SFNN bucket product");
+    static_assert(NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE
+        || NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+        || NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT,
+        "unsupported NNUE_SFNN_ROUTER_MODE");
+    static_assert(NNUE_SFNN_ROUTER_MODE != NNUE_SFNN_ROUTER_MODE_NONE || NNUE_SFNN_ROUTER_N == 0,
+        "NNUE_SFNN_ROUTER_N must be 0 when router is disabled");
+    static_assert(NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE || NNUE_SFNN_ROUTER_N >= 1,
+        "NNUE_SFNN_ROUTER_N must be >= 1 when router is enabled");
+    // routerkpabsではNNUE_SFNN_ROUTER_Nがそのままbucket数、routerft<R>ft<R>ではR*R。
+    static_assert(NNUE_SFNN_SELECTABLE_BUCKETS == NNUE_SFNN_HAND_BUCKETS * NNUE_SFNN_KING_BUCKETS
+        * NNUE_SFNN_PROGRESS_BUCKETS
+        * (NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS ? NNUE_SFNN_ROUTER_N
+           : NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT ? NNUE_SFNN_ROUTER_N * NNUE_SFNN_ROUTER_N
+           : 1),
+        "NNUE_SFNN_SELECTABLE_BUCKETS must match the SFNN bucket product (hand * king * progress * router)");
+    // NNUE_SFNN_ORDER_HAND/KING/PROGRESS/ROUTER は合成順序 (0=最上位桁..3=最下位桁) の
+    // ランクを表すので、{0,1,2,3} の順列でなければならない。
+    static_assert(NNUE_SFNN_ORDER_HAND + NNUE_SFNN_ORDER_KING + NNUE_SFNN_ORDER_PROGRESS
+        + NNUE_SFNN_ORDER_ROUTER == 0 + 1 + 2 + 3
+        && NNUE_SFNN_ORDER_HAND >= 0 && NNUE_SFNN_ORDER_HAND <= 3
+        && NNUE_SFNN_ORDER_KING >= 0 && NNUE_SFNN_ORDER_KING <= 3
+        && NNUE_SFNN_ORDER_PROGRESS >= 0 && NNUE_SFNN_ORDER_PROGRESS <= 3
+        && NNUE_SFNN_ORDER_ROUTER >= 0 && NNUE_SFNN_ORDER_ROUTER <= 3
+        && NNUE_SFNN_ORDER_HAND != NNUE_SFNN_ORDER_KING
+        && NNUE_SFNN_ORDER_HAND != NNUE_SFNN_ORDER_PROGRESS
+        && NNUE_SFNN_ORDER_HAND != NNUE_SFNN_ORDER_ROUTER
+        && NNUE_SFNN_ORDER_KING != NNUE_SFNN_ORDER_PROGRESS
+        && NNUE_SFNN_ORDER_KING != NNUE_SFNN_ORDER_ROUTER
+        && NNUE_SFNN_ORDER_PROGRESS != NNUE_SFNN_ORDER_ROUTER,
+        "NNUE_SFNN_ORDER_HAND/KING/PROGRESS/ROUTER must be a permutation of {0,1,2,3}");
+    // wsb (NNUE_SFNN_USE_SHARED_BUCKET) が有効なとき、「wsb の直前カテゴリ以降」の
+    // ブロック (選択バケット数 NNUE_SFNN_SHARED_BUCKET_INNER 個) が
+    // (NNUE_SFNN_SELECTABLE_BUCKETS / NNUE_SFNN_SHARED_BUCKET_INNER) 個並び、
+    // 各ブロックに共有バケットが1個ずつ挿入される。無効なら選択バケットのみ。
+    static_assert(!NNUE_SFNN_USE_SHARED_BUCKET
+        || NNUE_SFNN_SELECTABLE_BUCKETS % NNUE_SFNN_SHARED_BUCKET_INNER == 0,
+        "NNUE_SFNN_SHARED_BUCKET_INNER must evenly divide NNUE_SFNN_SELECTABLE_BUCKETS");
+    static_assert(kLayerStacks == (NNUE_SFNN_USE_SHARED_BUCKET
+        ? (NNUE_SFNN_SELECTABLE_BUCKETS / NNUE_SFNN_SHARED_BUCKET_INNER)
+              * (NNUE_SFNN_SHARED_BUCKET_INNER + 1)
+        : NNUE_SFNN_SELECTABLE_BUCKETS),
+        "LayerStacks must match NNUE_SFNN_SELECTABLE_BUCKETS, or "
+        "(NNUE_SFNN_SELECTABLE_BUCKETS / NNUE_SFNN_SHARED_BUCKET_INNER) * (NNUE_SFNN_SHARED_BUCKET_INNER + 1) "
+        "when wsb is enabled");
 
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int king3_by_king3_bucket(const Position& pos) {
@@ -655,46 +958,113 @@ namespace {
 #endif
     }
 
+#if NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+    // routerkpabs<N> : 学習済みRouterKPAbsのargmaxで1つのbucket (0..N-1) を選ぶ。
+    static int router_kpabs_bucket(const Position& pos) {
+        return networks().router_kpabs.BucketIndex(pos);
+    }
+#elif NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT
+    // routerft<R>ft<R> : FeatureTransformerのaccumulatorに同居するrouterの生スコア
+    // (perspectiveごとにR個) から、STM側/NSTM側それぞれargmaxを取り、R*R通りに combine する。
+    // (tatara側 `router_ftbyft.rs` 参照)
+    static int router_ftft_bucket(const Position& pos) {
+        // Transform()と同じく、差分計算を進めてからaccumulatorを直接読む。
+        networks().feature_transformer.UpdateAccumulatorIfPossible(pos);
+        const Color perspectives[2] = { pos.side_to_move(), ~pos.side_to_move() };
+        int sub_bucket[2];
+        for (int p = 0; p < 2; ++p) {
+            FeatureTransformer::BiasType raw[NNUE_SFNN_ROUTER_N];
+            networks().feature_transformer.RouterRawScores(pos, perspectives[p], raw);
+            int best = 0;
+            for (int k = 1; k < NNUE_SFNN_ROUTER_N; ++k)
+                if (raw[k] > raw[best])
+                    best = k;
+            sub_bucket[p] = best;
+        }
+        // p=0がSTM、p=1がNSTM。STM側を上位桁とする。
+        return sub_bucket[0] * NNUE_SFNN_ROUTER_N + sub_bucket[1];
+    }
+#endif
+
     static int stack_index_for_nnue(const Position& pos) {
-#if NNUE_SFNN_HAND_BUCKETS == 1 && NNUE_SFNN_KING_BUCKETS == 9 && NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3 && NNUE_SFNN_PROGRESS_BUCKETS == 1
+#if NNUE_SFNN_HAND_BUCKETS == 1 && NNUE_SFNN_KING_BUCKETS == 9 && NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3 && NNUE_SFNN_PROGRESS_BUCKETS == 1 && NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_NONE && !NNUE_SFNN_USE_SHARED_BUCKET
+        // カテゴリがking (k3k3) だけの、もっとも一般的なケース専用の近道。
+        // カテゴリが1つしか無いので合成順序 (NNUE_SFNN_ORDER_*) は関係ない。
         return king3_by_king3_bucket(pos);
 #else
-        int idx = 0;
+        // 各カテゴリの (バケット数, このバケットのindex) を求め、`NNUE_SFNN_ORDER_*`
+        // (合成順序、0=最上位桁 .. 3=最下位桁) に従って並べてから
+        // `idx = idx * count + index` で合成する (使われていないカテゴリは
+        // count=1, index=0 になるだけで、合成結果に影響しない)。
+        struct BucketDigit {
+            int count;
+            int index;
+        };
+        BucketDigit digits[4] = {};
 
 #if NNUE_SFNN_HAND_BUCKET_TYPE == NNUE_SFNN_HAND_BUCKET_TYPE_HAND4
-        idx = hand4_bucket(pos);
+        digits[NNUE_SFNN_ORDER_HAND] = {4, hand4_bucket(pos)};
 #elif NNUE_SFNN_HAND_BUCKET_TYPE == NNUE_SFNN_HAND_BUCKET_TYPE_HAND16
-        idx = hand16_bucket(pos);
+        digits[NNUE_SFNN_ORDER_HAND] = {16, hand16_bucket(pos)};
 #elif NNUE_SFNN_HAND_BUCKET_TYPE == NNUE_SFNN_HAND_BUCKET_TYPE_HAND64
-        idx = hand64_bucket(pos);
+        digits[NNUE_SFNN_ORDER_HAND] = {64, hand64_bucket(pos)};
 #elif NNUE_SFNN_HAND_BUCKET_TYPE == NNUE_SFNN_HAND_BUCKET_TYPE_HAND64Z
-        idx = hand64z_bucket(pos);
+        digits[NNUE_SFNN_ORDER_HAND] = {64, hand64z_bucket(pos)};
 #elif NNUE_SFNN_HAND_BUCKET_TYPE == NNUE_SFNN_HAND_BUCKET_TYPE_HAND256
-        idx = hand256_bucket(pos);
+        digits[NNUE_SFNN_ORDER_HAND] = {256, hand256_bucket(pos)};
 #elif NNUE_SFNN_HAND_BUCKET_TYPE == NNUE_SFNN_HAND_BUCKET_TYPE_HAND1024
-        idx = hand1024_bucket(pos);
+        digits[NNUE_SFNN_ORDER_HAND] = {1024, hand1024_bucket(pos)};
+#else
+        digits[NNUE_SFNN_ORDER_HAND] = {1, 0};
 #endif
 
 #if NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K3K3
-        idx = idx * 9 + king3_by_king3_bucket(pos);
+        digits[NNUE_SFNN_ORDER_KING] = {9, king3_by_king3_bucket(pos)};
 #elif NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K9K9
-        idx = idx * 81 + king9_by_king9_bucket(pos);
+        digits[NNUE_SFNN_ORDER_KING] = {81, king9_by_king9_bucket(pos)};
 #elif NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K9K9Z
-        idx = idx * 81 + king9_zone_by_king9_zone_bucket(pos);
+        digits[NNUE_SFNN_ORDER_KING] = {81, king9_zone_by_king9_zone_bucket(pos)};
 #elif NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K13K13Z
-        idx = idx * 169 + king13_zone_by_king13_zone_bucket(pos);
+        digits[NNUE_SFNN_ORDER_KING] = {169, king13_zone_by_king13_zone_bucket(pos)};
 #elif NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K21K21
-        idx = idx * 441 + king21_by_king21_bucket(pos);
+        digits[NNUE_SFNN_ORDER_KING] = {441, king21_by_king21_bucket(pos)};
 #elif NNUE_SFNN_KING_BUCKET_TYPE == NNUE_SFNN_KING_BUCKET_TYPE_K29K29
-        idx = idx * 841 + king29_by_king29_bucket(pos);
+        digits[NNUE_SFNN_ORDER_KING] = {841, king29_by_king29_bucket(pos)};
+#else
+        digits[NNUE_SFNN_ORDER_KING] = {1, 0};
 #endif
 
 #if NNUE_SFNN_PROGRESS_BUCKETS != 1
-        idx = idx * NNUE_SFNN_PROGRESS_BUCKETS + progress_bucket(pos);
+        digits[NNUE_SFNN_ORDER_PROGRESS] = {NNUE_SFNN_PROGRESS_BUCKETS, progress_bucket(pos)};
+#else
+        digits[NNUE_SFNN_ORDER_PROGRESS] = {1, 0};
 #endif
 
+#if NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_KPABS
+        digits[NNUE_SFNN_ORDER_ROUTER] = {NNUE_SFNN_ROUTER_N, router_kpabs_bucket(pos)};
+#elif NNUE_SFNN_ROUTER_MODE == NNUE_SFNN_ROUTER_MODE_FTFT
+        digits[NNUE_SFNN_ORDER_ROUTER] = {NNUE_SFNN_ROUTER_N * NNUE_SFNN_ROUTER_N,
+                                           router_ftft_bucket(pos)};
+#else
+        digits[NNUE_SFNN_ORDER_ROUTER] = {1, 0};
+#endif
+
+        int idx = 0;
+        for (const auto& digit : digits)
+            idx = idx * digit.count + digit.index;
+
         if (idx < 0) idx = 0;
-        if (idx >= kLayerStacks) idx = kLayerStacks - 1;
+        if (idx >= NNUE_SFNN_SELECTABLE_BUCKETS) idx = NNUE_SFNN_SELECTABLE_BUCKETS - 1;
+
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // wsb: 密index (0..NNUE_SFNN_SELECTABLE_BUCKETS-1) を、各外側ブロックに
+        // 共有バケット1個が挿入された実際の重み配列index (0..kLayerStacks-1) に
+        // 変換する (`kSharedBucketBlockSize` / `shared_bucket_index_for` 参照)。
+        const int outer_idx  = idx / NNUE_SFNN_SHARED_BUCKET_INNER;
+        const int inner_idx  = idx % NNUE_SFNN_SHARED_BUCKET_INNER;
+        idx                  = outer_idx * kSharedBucketBlockSize + inner_idx;
+#endif
+
         return idx;
 #endif
     }
@@ -707,24 +1077,68 @@ namespace {
             return accumulator.score;
         }
 
+#if defined(ENABLE_SFNN_16BIT_WEIGHT) && defined(NNUE_SFNN_USE_SHARED_BUCKET) && NNUE_SFNN_USE_SHARED_BUCKET
+#error ENABLE_SFNN_16BIT_WEIGHT does not support WSB (shared bucket) architectures yet
+#endif
+#if defined(ENABLE_SFNN_16BIT_WEIGHT)
+        using RawOutputType = std::int64_t;
+#else
+        using RawOutputType = std::int32_t;
+#endif
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
 #if defined(SFNNwoPSQT)
         const auto bucket = stack_index_for_nnue(pos);
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // 選択bucketと共有bucket (index shared_bucket_index_for(bucket)) の中間活性を同時に
+        // 保持する必要があるため、`buffer`とは別にもう1つ確保する
+        // (`PropagatePair`/`PropagatePairFromAccumulator`はこの2つに書き込む)。
+        alignas(kCacheLineSize) char buffer2[Network::kBufferSize];
+#endif
 #if defined(USE_AVX512) && defined(NNUE_HAS_SFNN_ACCUMULATOR_PROPAGATE)
         networks().feature_transformer.EnsureAccumulator(pos, refresh);
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // wsb: 選択bucketと共有bucket、2つのネットワークの出力 (FV_SCALE適用前の
+        // raw値) の平均を評価値にする。`PropagatePairFromAccumulator`が両方を
+        // まとめて計算する (fc_1/fc_2は1つのSIMDループで両bucket分を計算する —
+        // `Network::PropagatePairFromAccumulator`のコメント参照)。
+        const auto scores = networks().network[bucket].PropagatePairFromAccumulator(
+            accumulator.accumulation, pos.side_to_move(),
+            networks().network[shared_bucket_index_for(bucket)], buffer, buffer2);
+        const std::int32_t raw_output = scores.a + scores.b;
+        const int kScoreDivisor = FV_SCALE;
+#else
         const auto output = networks().network[bucket].PropagateFromAccumulator(
             accumulator.accumulation, pos.side_to_move(), buffer);
+        const RawOutputType raw_output = output[0];
+        const int kScoreDivisor = FV_SCALE;
+#endif
 #else
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
         networks().feature_transformer.Transform(pos, transformed_features, refresh);
+#if NNUE_SFNN_USE_SHARED_BUCKET
+        // wsb: 選択bucketと共有bucket、2つのネットワークの出力 (FV_SCALE適用前の
+        // raw値) の平均を評価値にする。`PropagatePair`が両方をまとめて計算する
+        // (fc_0/fc_1/fc_2すべてを1つのSIMDループで両bucket分計算する —
+        // `Network::PropagatePair`のコメント参照。`Propagate`を2回呼ぶ場合と
+        // 数値結果は完全に一致する)。
+        const auto scores = networks().network[bucket].PropagatePair(
+            transformed_features, networks().network[shared_bucket_index_for(bucket)], buffer, buffer2);
+        const std::int32_t raw_output = scores.a + scores.b;
+        const int kScoreDivisor = FV_SCALE;
+#else
         const auto output = networks().network[bucket].Propagate(transformed_features, buffer);
+        const RawOutputType raw_output = output[0];
+        const int kScoreDivisor = FV_SCALE;
+#endif
 #endif
 #else
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
         networks().feature_transformer.Transform(pos, transformed_features, refresh);
         const auto output = networks().network[0].Propagate(transformed_features, buffer);
+        const RawOutputType raw_output = output[0];
+        const int kScoreDivisor = FV_SCALE;
 #endif
 
         // VALUE_MAX_EVALより大きな値が返ってくるとaspiration searchがfail highして
@@ -739,7 +1153,13 @@ namespace {
         // しかし、教師生成時などdepth固定で探索するときに探索から戻ってこなくなるので
         // そのスレッドの計算時間を無駄にする。またdepth固定対局でtime-outするようになる。
 
-        auto score = static_cast<Value>(output[0] / FV_SCALE);
+#if defined(ENABLE_SFNN_16BIT_WEIGHT)
+        // 16bit weight版の出力はint64。範囲外の値でint32/Valueに丸められないよう先にclampする。
+        auto score = static_cast<Value>(std::clamp<std::int64_t>(
+            raw_output / kScoreDivisor, -VALUE_MAX_EVAL, VALUE_MAX_EVAL));
+#else
+        auto score = static_cast<Value>(raw_output / kScoreDivisor);
+#endif
 
         // 1) ここ、下手にclipすると学習時には影響があるような気もするが…。
         // 2) accumulator.scoreは、差分計算の時に用いないので書き換えて問題ない。
@@ -820,16 +1240,25 @@ void load_eval() {
 		// WASM
         const std::string file_name = Options["EvalFile"];
     #endif
+        std::string failed_file = file_name;
         const Tools::Result result = [&] {
             if (dir_name != "<internal>") {
+            #if !defined(__EMSCRIPTEN__)
                 auto abs_eval_path = Path::Combine(Directory::GetBinaryFolder(), dir_name);
+            #else
+                // 📝 wasmでは評価関数ファイルはEmscriptenの仮想FS上にある。
+                //     Directory::GetBinaryFolder()はホスト側のパスを返すので前置せず、
+                //     EvalDirをそのまま仮想FS上のパスとして扱う。
+                auto abs_eval_path = dir_name;
+            #endif
                 const std::string file_path = Path::Combine(abs_eval_path, file_name);
+                failed_file = file_path;
                 std::ifstream stream(file_path, std::ios::binary);
                 sync_cout << "info string loading eval file : " << file_path << sync_endl;
 				if (!stream.is_open())
 					return Tools::Result(Tools::ResultCode::FileNotFound);
 
-                return NNUE::ReadParameters(stream);
+                return NNUE::ReadParameters(stream, &failed_file);
             }
             else {
                 // C++ way to prepare a buffer for a memory stream
@@ -849,7 +1278,7 @@ void load_eval() {
                 std::istream stream(&buffer);
                 sync_cout << "info string loading eval file : <internal>" << sync_endl;
 
-                return NNUE::ReadParameters(stream);
+                return NNUE::ReadParameters(stream, &failed_file);
             }
         }();
 
@@ -858,7 +1287,7 @@ void load_eval() {
         if (result.is_not_ok())
         {
             // 読み込みエラーのとき終了してくれないと困る。
-            sync_cout << "Error! : failed to read " << file_name << " : " << result.to_string() << sync_endl;
+            sync_cout << "Error! : failed to read " << failed_file << " : " << result.to_string() << sync_endl;
             Tools::exit();
         }
 

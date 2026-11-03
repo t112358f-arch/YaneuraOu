@@ -496,6 +496,7 @@
     <ClInclude Include="engine\dlshogi-engine\FukauraOuEngine.h" />
     <ClInclude Include="engine\dlshogi-engine\misc\fastmath.h" />
     <ClInclude Include="engine\dlshogi-engine\Node.h" />
+    <ClInclude Include="engine\dlshogi-engine\PolicyValueCache.h" />
     <ClInclude Include="engine\dlshogi-engine\PrintInfo.h" />
     <ClInclude Include="engine\dlshogi-engine\PvMateSearch.h" />
     <ClInclude Include="engine\dlshogi-engine\SearchOptions.h" />

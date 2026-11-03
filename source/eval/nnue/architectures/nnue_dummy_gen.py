@@ -212,8 +212,14 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec: str):
     }
     progress_values = {2, 3, 4, 8, 16, 32}
 
-    for token in [t for t in normalized.split("_") if t]:
-        if token in hand_map:
+    shared_bucket = 0
+    tokens = [t for t in normalized.split("_") if t]
+    for pos, token in enumerate(tokens):
+        if token == "WSB":
+            if pos != len(tokens) - 1:
+                raise ValueError(f"wsb (WithSharedBucket) must be the last token in {layer_stack_spec}")
+            shared_bucket = 1
+        elif token in hand_map:
             if hand_buckets != 1:
                 raise ValueError(f"duplicate SFNN hand bucket in {layer_stack_spec}")
             hand_buckets = hand_map[token]
@@ -231,7 +237,9 @@ def parse_sfnn_layer_stack_spec(layer_stack_spec: str):
         else:
             raise ValueError(f"unsupported SFNN layer stack token: {token}")
 
-    return hand_buckets * king_buckets * progress_buckets, hand_buckets, king_buckets, progress_buckets
+    # wsb は「常に選ばれる共有バケット」を1個追加する (index は常に末尾)。
+    return (hand_buckets * king_buckets * progress_buckets + shared_bucket,
+        hand_buckets, king_buckets, progress_buckets)
 
 def write_normal_network(stream, transformed_dims: int, first_layer_multiplier: int, hidden1: int, hidden2: int, rng: random.Random, mode: str) -> None:
     write_u32(stream, normal_network_hash(transformed_dims, first_layer_multiplier, hidden1, hidden2))
